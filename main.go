@@ -79,12 +79,12 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL   string `json:"debug_url"`
+	ChromePID  int    `json:"chrome_pid"`
+	ActivePage int    `json:"active_page"` // index into pages list
+	DataDir    string `json:"data_dir"`
+	ProxyPID   int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
+	ProxyPort  int    `json:"proxy_port,omitempty"` // local port of auth proxy
 }
 
 func stateDir() string {
@@ -126,7 +126,7 @@ func saveState(s *State) error {
 }
 
 func removeState() {
-	os.Remove(statePath())
+	_ = os.Remove(statePath())
 }
 
 // connectBrowser connects to the running Chrome instance
@@ -372,13 +372,15 @@ func cmdStart(args []string) {
 	}
 
 	dataDir := filepath.Join(stateDir(), "chrome-data")
-	os.MkdirAll(dataDir, 0755)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		fatal("failed to create data dir: %v", err)
+	}
 
 	l := launcher.New().
 		Set("no-sandbox").
 		Set("disable-gpu").
 		Set("single-process"). // Required for screenshots in gVisor/container environments
-		Leakless(false).        // Keep Chrome alive after CLI exits
+		Leakless(false).       // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
 
@@ -403,7 +405,7 @@ func cmdStart(args []string) {
 			fatal("failed to find free port for proxy: %v", err)
 		}
 		proxyPort = ln.Addr().(*net.TCPAddr).Port
-		ln.Close()
+		_ = ln.Close()
 
 		// Launch ourselves as the proxy helper in the background
 		exe, _ := os.Executable()
@@ -415,7 +417,7 @@ func cmdStart(args []string) {
 		}
 		proxyPID = cmd.Process.Pid
 		// Detach so it survives after we exit
-		cmd.Process.Release()
+		_ = cmd.Process.Release()
 
 		// Wait for the proxy to be ready
 		time.Sleep(500 * time.Millisecond)
@@ -465,7 +467,7 @@ func cmdConnect(args []string) {
 	if err != nil {
 		fatal("could not reach browser at %s: %v", hostport, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fatal("failed to read response: %v", err)
@@ -508,7 +510,7 @@ func cmdStop(args []string) {
 		if s.ChromePID > 0 {
 			proc, err := os.FindProcess(s.ChromePID)
 			if err == nil {
-				proc.Signal(syscall.SIGTERM)
+				_ = proc.Signal(syscall.SIGTERM)
 			}
 		}
 	} else if s.ChromePID > 0 {
@@ -519,7 +521,7 @@ func cmdStop(args []string) {
 	// Also kill the proxy helper if running
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
-			proc.Signal(syscall.SIGTERM)
+			_ = proc.Signal(syscall.SIGTERM)
 		}
 	}
 	removeState()
@@ -575,7 +577,7 @@ func cmdOpen(args []string) {
 	if len(pages) == 0 {
 		page = browser.MustPage(url)
 		s.ActivePage = 0
-		saveState(s)
+		_ = saveState(s)
 	} else {
 		page, err = getActivePage(browser, s)
 		if err != nil {
@@ -616,7 +618,9 @@ func cmdReload(args []string) {
 	fs := flag.NewFlagSet("reload", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	hard := fs.Bool("hard", false, "")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		fatal("%v", err)
+	}
 	_, _, page := withPage()
 	if *hard {
 		// CDP Page.reload with ignoreCache (equivalent to Shift+Refresh)
@@ -704,8 +708,9 @@ func cmdAttr(args []string) {
 	val := el.MustAttribute(args[1])
 	if val == nil {
 		fatal("attribute %q not found", args[1])
+	} else {
+		fmt.Println(*val)
 	}
-	fmt.Println(*val)
 }
 
 func cmdPDF(args []string) {
@@ -838,10 +843,12 @@ func cmdFile(args []string) {
 			fatal("failed to create temp file: %v", err)
 		}
 		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			fatal("failed to write temp file: %v", err)
 		}
-		tmp.Close()
+		if err := tmp.Close(); err != nil {
+			fatal("failed to close temp file: %v", err)
+		}
 		filePath = tmp.Name()
 	} else {
 		if _, err := os.Stat(filePath); err != nil {
@@ -913,7 +920,9 @@ func cmdDownload(args []string) {
 	}
 
 	if outFile == "-" {
-		os.Stdout.Write(data)
+		if _, err := os.Stdout.Write(data); err != nil {
+			fatal("failed to write output: %v", err)
+		}
 		return
 	}
 
@@ -1292,7 +1301,7 @@ func cmdNewPage(args []string) {
 			break
 		}
 	}
-	saveState(s)
+	_ = saveState(s)
 
 	info, _ := page.Info()
 	if info != nil {
@@ -1337,7 +1346,7 @@ func cmdClosePage(args []string) {
 	if s.ActivePage < 0 {
 		s.ActivePage = 0
 	}
-	saveState(s)
+	_ = saveState(s)
 	fmt.Printf("Closed page %d\n", idx)
 }
 
@@ -1581,7 +1590,9 @@ func cmdAXNode(args []string) {
 
 	fs := flag.NewFlagSet("ax-node", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.Parse(filtered)
+	if err := fs.Parse(filtered); err != nil {
+		fatal("%v", err)
+	}
 
 	if fs.NArg() < 1 {
 		fatal("usage: rodney ax-node <selector> [--json]")
@@ -1611,7 +1622,7 @@ func queryAXNodes(page *rod.Page, name, role string) ([]*proto.AccessibilityAXNo
 	}
 
 	result, err := proto.AccessibilityQueryAXTree{
-		BackendNodeID: doc.Root.BackendNodeID,
+		BackendNodeID:  doc.Root.BackendNodeID,
 		AccessibleName: name,
 		Role:           role,
 	}.Call(page)
@@ -1803,19 +1814,19 @@ func formatAXNodeList(nodes []*proto.AccessibilityAXNode) string {
 // formatAXNodeDetail formats a single node with all its properties in key: value format.
 func formatAXNodeDetail(node *proto.AccessibilityAXNode) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("role: %s\n", axValueStr(node.Role)))
+	fmt.Fprintf(&sb, "role: %s\n", axValueStr(node.Role))
 	if name := axValueStr(node.Name); name != "" {
-		sb.WriteString(fmt.Sprintf("name: %s\n", name))
+		fmt.Fprintf(&sb, "name: %s\n", name)
 	}
 	if desc := axValueStr(node.Description); desc != "" {
-		sb.WriteString(fmt.Sprintf("description: %s\n", desc))
+		fmt.Fprintf(&sb, "description: %s\n", desc)
 	}
 	if val := axValueStr(node.Value); val != "" {
-		sb.WriteString(fmt.Sprintf("value: %s\n", val))
+		fmt.Fprintf(&sb, "value: %s\n", val)
 	}
 	for _, p := range node.Properties {
 		val := axValueStr(p.Value)
-		sb.WriteString(fmt.Sprintf("%s: %s\n", p.Name, val))
+		fmt.Fprintf(&sb, "%s: %s\n", p.Name, val)
 	}
 	return sb.String()
 }
@@ -1884,7 +1895,9 @@ func cmdInternalProxy(args []string) {
 			}
 		}),
 	}
-	server.Serve(listener) // blocks forever
+	if err := server.Serve(listener); err != nil { // blocks until the server stops
+		fatal("proxy server failed: %v", err)
+	}
 }
 
 func proxyConnect(w http.ResponseWriter, r *http.Request, upstream, authHeader string) {
@@ -1897,7 +1910,7 @@ func proxyConnect(w http.ResponseWriter, r *http.Request, upstream, authHeader s
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
 		r.Host, r.Host, authHeader)
 	if _, err := upstreamConn.Write([]byte(connectReq)); err != nil {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "upstream write failed", http.StatusBadGateway)
 		return
 	}
@@ -1905,38 +1918,38 @@ func proxyConnect(w http.ResponseWriter, r *http.Request, upstream, authHeader s
 	buf := make([]byte, 4096)
 	n, err := upstreamConn.Read(buf)
 	if err != nil {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "upstream read failed", http.StatusBadGateway)
 		return
 	}
 	response := string(buf[:n])
 	if len(response) < 12 || response[9:12] != "200" {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "upstream rejected CONNECT", http.StatusBadGateway)
 		return
 	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		return
 	}
 
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	go func() {
-		io.Copy(upstreamConn, clientConn)
-		upstreamConn.Close()
+		_, _ = io.Copy(upstreamConn, clientConn)
+		_ = upstreamConn.Close()
 	}()
 	go func() {
-		io.Copy(clientConn, upstreamConn)
-		clientConn.Close()
+		_, _ = io.Copy(clientConn, upstreamConn)
+		_ = clientConn.Close()
 	}()
 }
 
@@ -1955,7 +1968,7 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, upstream, authHeader stri
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -1963,5 +1976,5 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, upstream, authHeader stri
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }

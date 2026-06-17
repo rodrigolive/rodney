@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 // Standalone test script to reproduce the gVisor screenshot issue.

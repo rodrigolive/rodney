@@ -66,7 +66,7 @@ func TestMain(m *testing.M) {
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Test Page</title></head>
 <body>
@@ -86,7 +86,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func handleForm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Form Page</title></head>
 <body>
@@ -108,7 +108,7 @@ func handleForm(w http.ResponseWriter, r *http.Request) {
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Upload Page</title></head>
 <body>
@@ -125,7 +125,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Download Page</title></head>
 <body>
@@ -138,12 +138,12 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 
 func handleTestFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("Hello World"))
+	_, _ = w.Write([]byte("Hello World"))
 }
 
 func handleEmpty(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Empty Page</title></head>
 <body></body>
@@ -468,9 +468,9 @@ func TestFile_SetFileOnInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp file: %v", err)
 	}
-	defer os.Remove(tmp.Name())
-	tmp.Write([]byte("test content"))
-	tmp.Close()
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	_, _ = tmp.Write([]byte("test content"))
+	_ = tmp.Close()
 
 	el, err := page.Element("#file-input")
 	if err != nil {
@@ -496,14 +496,14 @@ func TestFile_MultipleFiles(t *testing.T) {
 	page := navigateTo(t, "/upload")
 
 	tmp1, _ := os.CreateTemp("", "rodney-test1-*.txt")
-	defer os.Remove(tmp1.Name())
-	tmp1.Write([]byte("file 1"))
-	tmp1.Close()
+	defer func() { _ = os.Remove(tmp1.Name()) }()
+	_, _ = tmp1.Write([]byte("file 1"))
+	_ = tmp1.Close()
 
 	tmp2, _ := os.CreateTemp("", "rodney-test2-*.txt")
-	defer os.Remove(tmp2.Name())
-	tmp2.Write([]byte("file 2"))
-	tmp2.Close()
+	defer func() { _ = os.Remove(tmp2.Name()) }()
+	_, _ = tmp2.Write([]byte("file 2"))
+	_ = tmp2.Close()
 
 	el, err := page.Element("#file-input")
 	if err != nil {
@@ -702,8 +702,8 @@ func TestResolveStateDir_AutoPrefersLocal(t *testing.T) {
 	// Create a temp directory with a .rodney/state.json to simulate local session
 	tmpDir := t.TempDir()
 	localRodney := filepath.Join(tmpDir, ".rodney")
-	os.MkdirAll(localRodney, 0755)
-	os.WriteFile(filepath.Join(localRodney, "state.json"), []byte(`{}`), 0644)
+	_ = os.MkdirAll(localRodney, 0755)
+	_ = os.WriteFile(filepath.Join(localRodney, "state.json"), []byte(`{}`), 0644)
 
 	dir := resolveStateDir(scopeAuto, tmpDir)
 	if dir != localRodney {
@@ -923,10 +923,10 @@ func TestAssert_ValueFormatting_MatchesJSCommand(t *testing.T) {
 		expr     string
 		expected string
 	}{
-		{`document.title`, "Test Page"},   // string unquoted
-		{`1 + 2`, "3"},                    // number
-		{`true`, "true"},                  // boolean
-		{`null`, "null"},                  // null
+		{`document.title`, "Test Page"}, // string unquoted
+		{`1 + 2`, "3"},                  // number
+		{`true`, "true"},                // boolean
+		{`null`, "null"},                // null
 		{`document.querySelectorAll("button").length`, "2"}, // number from DOM
 	}
 
@@ -1155,7 +1155,7 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`<!DOCTYPE html>
+		_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html><head><title>Secure Test</title></head>
 <body><h1>HTTPS Test Page</h1></body></html>`))
 	})
