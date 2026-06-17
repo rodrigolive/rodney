@@ -55,6 +55,7 @@ func TestMain(m *testing.M) {
 	mux.HandleFunc("/slow", handleSlow)
 	mux.HandleFunc("/hang", handleHang)
 	mux.HandleFunc("/notfound", handleNotFound)
+	mux.HandleFunc("/ua", handleUA)
 	server := httptest.NewServer(mux)
 
 	env = &testEnv{browser: browser, server: server}
@@ -177,6 +178,12 @@ func handleHang(w http.ResponseWriter, r *http.Request) {
 func handleNotFound(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = w.Write([]byte("not found"))
+}
+
+// handleUA echoes the request's User-Agent into an element, for UA-override tests.
+func handleUA(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><body><pre id="ua">%s</pre></body></html>`, r.UserAgent())
 }
 
 // --- Helper: navigate to a fixture and return the page ---
@@ -1108,69 +1115,82 @@ func TestFormatAssertFail_EqualityWithMessage(t *testing.T) {
 // =====================
 
 func TestParseStartArgs_NoFlags(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{})
+	opts, err := parseStartArgs([]string{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if insecure {
+	if opts.insecure {
 		t.Error("expected insecure=false with no flags")
 	}
-	if !headless {
+	if !opts.headless {
 		t.Error("expected headless=true with no flags")
 	}
 }
 
 func TestParseStartArgs_ShowFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show"})
+	opts, err := parseStartArgs([]string{"--show"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if insecure {
+	if opts.insecure {
 		t.Error("expected insecure=false")
 	}
-	if headless {
+	if opts.headless {
 		t.Error("expected headless=false when --show is passed")
 	}
 }
 
 func TestParseStartArgs_InsecureFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--insecure"})
+	opts, err := parseStartArgs([]string{"--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !insecure {
+	if !opts.insecure {
 		t.Error("expected insecure=true when --insecure is passed")
 	}
-	if !headless {
+	if !opts.headless {
 		t.Error("expected headless=true when only --insecure is passed")
 	}
 }
 
 func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
-	insecure, _, err := parseStartArgs([]string{"-k"})
+	opts, err := parseStartArgs([]string{"-k"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !insecure {
+	if !opts.insecure {
 		t.Error("expected insecure=true when -k is passed")
 	}
 }
 
 func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show", "--insecure"})
+	opts, err := parseStartArgs([]string{"--show", "--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !insecure {
+	if !opts.insecure {
 		t.Error("expected insecure=true")
 	}
-	if headless {
+	if opts.headless {
 		t.Error("expected headless=false when --show is passed")
 	}
 }
 
+func TestParseStartArgs_UserAgentAndStealth(t *testing.T) {
+	opts, err := parseStartArgs([]string{"--stealth", "--user-agent", "Custom/1.0"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !opts.stealth {
+		t.Error("expected stealth=true")
+	}
+	if opts.userAgent != "Custom/1.0" {
+		t.Errorf("expected userAgent=Custom/1.0, got %q", opts.userAgent)
+	}
+}
+
 func TestParseStartArgs_UnknownFlag(t *testing.T) {
-	_, _, err := parseStartArgs([]string{"--bogus"})
+	_, err := parseStartArgs([]string{"--bogus"})
 	if err == nil {
 		t.Fatal("expected error for unknown flag --bogus")
 	}
@@ -1376,5 +1396,61 @@ func TestNavigateCapturingStatus_NotFound(t *testing.T) {
 	}
 	if status != 404 {
 		t.Errorf("expected HTTP 404, got %d", status)
+	}
+}
+
+func TestEvalJSExpr_Default(t *testing.T) {
+	page := navigateTo(t, "/")
+	if out, err := evalJSExpr(page, "1 + 1", false); err != nil || out != "2" {
+		t.Errorf("expected 2, got %q (err %v)", out, err)
+	}
+	if out, err := evalJSExpr(page, "'hello'", false); err != nil || out != "hello" {
+		t.Errorf("expected hello (unquoted), got %q (err %v)", out, err)
+	}
+}
+
+func TestEvalJSExpr_JSON(t *testing.T) {
+	page := navigateTo(t, "/")
+	out, err := evalJSExpr(page, "({a: 1, b: [2, 3]})", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out)
+	}
+	if parsed["a"] != float64(1) {
+		t.Errorf("expected a=1 in parsed JSON, got %v", parsed["a"])
+	}
+}
+
+func TestEvalJSExpr_JSONQuotesStrings(t *testing.T) {
+	page := navigateTo(t, "/")
+	out, err := evalJSExpr(page, "'hi'", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != `"hi"` {
+		t.Errorf("--json should emit a quoted JSON string, got %q", out)
+	}
+}
+
+func TestApplyUserAgent(t *testing.T) {
+	page := env.browser.MustPage("")
+	t.Cleanup(func() { page.MustClose() })
+	if err := applyUserAgent(page, "RodneyTest/9.9"); err != nil {
+		t.Fatalf("applyUserAgent failed: %v", err)
+	}
+	page.MustNavigate(env.server.URL + "/ua").MustWaitLoad()
+	if got := page.MustElement("#ua").MustText(); got != "RodneyTest/9.9" {
+		t.Errorf("expected the overridden UA to be echoed, got %q", got)
+	}
+}
+
+func TestApplyStealthFlags(t *testing.T) {
+	l := launcher.New()
+	applyStealthFlags(l)
+	if got := l.Get("disable-blink-features"); got != "AutomationControlled" {
+		t.Errorf("stealth should disable the AutomationControlled blink feature, got %q", got)
 	}
 }

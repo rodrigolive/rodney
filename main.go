@@ -22,6 +22,7 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 )
 
 //go:embed help.txt
@@ -226,6 +227,8 @@ func main() {
 		cmdStop(args)
 	case "status":
 		cmdStatus(args)
+	case "version":
+		fmt.Println(version)
 	case "open":
 		cmdOpen(args)
 	case "back":
@@ -444,32 +447,107 @@ func navigateCapturingStatus(page *rod.Page, url string) (int, error) {
 	return status, nil
 }
 
+// formatEvalValue renders a JS eval result: strings unquoted, objects/arrays
+// pretty-printed as JSON, everything else as its JSON form.
+func formatEvalValue(v gson.JSON) string {
+	raw := v.JSON("", "")
+	switch {
+	case raw == "null" || raw == "undefined":
+		return raw
+	case raw == "true" || raw == "false":
+		return raw
+	case len(raw) > 0 && raw[0] == '"':
+		return v.Str()
+	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
+		return v.JSON("", "  ")
+	default:
+		return raw
+	}
+}
+
+// evalJSExpr evaluates a bare JS expression on the page and returns its printable
+// form. When asJSON is true the value is JSON.stringify'd and pretty-printed so
+// the output is always valid JSON (ideal for piping to jq/jaq).
+func evalJSExpr(page *rod.Page, expr string, asJSON bool) (string, error) {
+	if asJSON {
+		result, err := page.Eval(fmt.Sprintf(`() => JSON.stringify((%s) ?? null)`, expr))
+		if err != nil {
+			return "", err
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(result.Value.Str()), &parsed); err != nil {
+			return "", fmt.Errorf("result is not JSON-serializable: %w", err)
+		}
+		out, err := json.MarshalIndent(parsed, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	}
+	result, err := page.Eval(fmt.Sprintf(`() => { return (%s); }`, expr))
+	if err != nil {
+		return "", err
+	}
+	return formatEvalValue(result.Value), nil
+}
+
+// applyUserAgent overrides the page's User-Agent for subsequent requests.
+func applyUserAgent(page *rod.Page, ua string) error {
+	return page.SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: ua})
+}
+
+// stealthUserAgent is a realistic desktop Chrome UA used by --stealth when no
+// explicit --user-agent is given, so the headless give-away ("HeadlessChrome")
+// is removed from requests.
+const stealthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// applyStealthFlags sets launcher flags that hide the most common headless
+// automation tells (navigator.webdriver via AutomationControlled, and the
+// automation banner). Lightweight, launch-only — not a full anti-bot bypass.
+func applyStealthFlags(l *launcher.Launcher) {
+	l.Set("disable-blink-features", "AutomationControlled")
+	l.Delete("enable-automation")
+}
+
 // --- Commands ---
 
+const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth]"
+
+// startOpts holds the parsed flags for the "start" command.
+type startOpts struct {
+	insecure  bool
+	headless  bool
+	userAgent string
+	stealth   bool
+}
+
 // parseStartArgs parses the flags for the "start" command.
-// Returns ignoreCertErrors, headless, and an error for unknown flags.
-func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, err error) {
+func parseStartArgs(args []string) (startOpts, error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.BoolVar(&ignoreCertErrors, "insecure", false, "")
-	fs.BoolVar(&ignoreCertErrors, "k", false, "")
+	var o startOpts
+	fs.BoolVar(&o.insecure, "insecure", false, "")
+	fs.BoolVar(&o.insecure, "k", false, "")
+	fs.StringVar(&o.userAgent, "user-agent", "", "")
+	fs.BoolVar(&o.stealth, "stealth", false, "")
 	show := fs.Bool("show", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", findUnknownFlag(args, fs))
+		return startOpts{headless: true}, fmt.Errorf("unknown flag: %s\n%s", findUnknownFlag(args, fs), startUsage)
 	}
 	if fs.NArg() > 0 {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", fs.Arg(0))
+		return startOpts{headless: true}, fmt.Errorf("unknown flag: %s\n%s", fs.Arg(0), startUsage)
 	}
-	headless = !*show
-	return ignoreCertErrors, headless, nil
+	o.headless = !*show
+	return o, nil
 }
 
 func cmdStart(args []string) {
-	ignoreCertErrors, headless, err := parseStartArgs(args)
+	opts, err := parseStartArgs(args)
 	if err != nil {
 		fatal("%s", err)
 	}
+	ignoreCertErrors, headless := opts.insecure, opts.headless
 
 	// Check if already running
 	if s, err := loadState(); err == nil {
@@ -502,6 +580,19 @@ func cmdStart(args []string) {
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)
+	}
+
+	// Stealth + user-agent: --stealth hides the headless automation tells and,
+	// absent an explicit --user-agent, swaps in a non-headless UA.
+	ua := opts.userAgent
+	if opts.stealth {
+		applyStealthFlags(l)
+		if ua == "" {
+			ua = stealthUserAgent
+		}
+	}
+	if ua != "" {
+		l.Set("user-agent", ua)
 	}
 
 	// Detect authenticated proxy and launch helper if needed
@@ -639,6 +730,7 @@ func cmdStop(args []string) {
 }
 
 func cmdStatus(args []string) {
+	fmt.Printf("rodney %s\n", version)
 	s, err := loadState()
 	if err != nil {
 		fmt.Println("No active browser session")
@@ -662,7 +754,7 @@ func cmdStatus(args []string) {
 	}
 }
 
-const openUsage = "usage: rodney open <url> [--no-wait] [--wait load|domcontentloaded|none] [--timeout SEC] [--expect-ok]"
+const openUsage = "usage: rodney open <url> [--no-wait] [--wait load|domcontentloaded|none] [--timeout SEC] [--expect-ok] [--then-js EXPR] [--user-agent UA]"
 
 func cmdOpen(args []string) {
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
@@ -671,6 +763,8 @@ func cmdOpen(args []string) {
 	waitMode := fs.String("wait", "load", "")
 	timeoutSecs := fs.Float64("timeout", 0, "")
 	expectOK := fs.Bool("expect-ok", false, "")
+	thenJS := fs.String("then-js", "", "")
+	userAgent := fs.String("user-agent", "", "")
 
 	positionals, err := parseFlagsInterspersed(fs, args)
 	if err != nil {
@@ -724,6 +818,12 @@ func cmdOpen(args []string) {
 	}
 	page = page.Timeout(timeout)
 
+	if *userAgent != "" {
+		if err := applyUserAgent(page, *userAgent); err != nil {
+			fatal("failed to set user agent: %v", err)
+		}
+	}
+
 	// Capture the document status only when --expect-ok asks for it (it adds a
 	// NetworkResponseReceived round-trip we don't want on the common path).
 	var status int
@@ -747,6 +847,17 @@ func cmdOpen(args []string) {
 		if status > 0 {
 			fmt.Fprintf(os.Stderr, "HTTP %d\n", status)
 		}
+	}
+
+	// --then-js folds navigate + extract into one process (cheaper for bulk
+	// lookups); otherwise print the page title as before.
+	if *thenJS != "" {
+		out, err := evalJSExpr(page, *thenJS, false)
+		if err != nil {
+			fatal("JS error: %v%s", err, navHint(err))
+		}
+		fmt.Println(out)
+		return
 	}
 
 	info, _ := page.Info()
@@ -922,41 +1033,22 @@ func cmdJS(args []string) {
 	fs := flag.NewFlagSet("js", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	timeoutSecs := fs.Float64("timeout", 0, "")
+	jsonOut := fs.Bool("json", false, "")
 	if err := fs.Parse(args); err != nil {
-		fatal("unknown flag: %s\nusage: rodney js [--timeout SEC] <expression>", findUnknownFlag(args, fs))
+		fatal("unknown flag: %s\nusage: rodney js [--timeout SEC] [--json] <expression>", findUnknownFlag(args, fs))
 	}
 	rest := fs.Args()
 	if len(rest) < 1 {
-		fatal("usage: rodney js [--timeout SEC] <expression>")
+		fatal("usage: rodney js [--timeout SEC] [--json] <expression>")
 	}
 	expr := strings.Join(rest, " ")
 	_, _, page := withPageTimeout(resolveTimeout(*timeoutSecs))
 
-	// Wrap bare expressions in a function
-	js := fmt.Sprintf(`() => { return (%s); }`, expr)
-	result, err := page.Eval(js)
+	out, err := evalJSExpr(page, expr, *jsonOut)
 	if err != nil {
 		fatal("JS error: %v", err)
 	}
-	// Print the value based on its JSON type
-	v := result.Value
-	raw := v.JSON("", "")
-	// For simple types, print cleanly; for objects/arrays, pretty-print
-	switch {
-	case raw == "null" || raw == "undefined":
-		fmt.Println(raw)
-	case raw == "true" || raw == "false":
-		fmt.Println(raw)
-	case len(raw) > 0 && raw[0] == '"':
-		// String value - print unquoted
-		fmt.Println(v.Str())
-	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
-		// Object or array - pretty print
-		fmt.Println(v.JSON("", "  "))
-	default:
-		// Numbers and other primitives
-		fmt.Println(raw)
-	}
+	fmt.Println(out)
 }
 
 func cmdClick(args []string) {

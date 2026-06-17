@@ -33,7 +33,7 @@ go build -o rodney .
 ```
 
 Requires:
-- Go 1.21+
+- Go 1.25+
 - Google Chrome or Chromium installed (or set `ROD_CHROME_BIN=/path/to/chrome`)
 
 ## Usage
@@ -44,15 +44,18 @@ Requires:
 rodney start              # Launch headless Chrome
 rodney start --show       # Launch with visible browser window
 rodney start --insecure   # Launch with TLS errors ignored (-k shorthand)
+rodney start --stealth    # Hide common headless automation tells
+rodney start --user-agent "Mozilla/5.0 (...) Chrome/131.0.0.0 ..."  # Override the User-Agent
 rodney connect host:9222  # Connect to existing Chrome on remote debug port
-rodney status             # Show browser info and active page
+rodney status             # Show browser info and active page (includes version)
+rodney version            # Print version
 rodney stop               # Shut down Chrome
 ```
 
 ### Navigate
 
 ```bash
-rodney open https://example.com    # Navigate to URL
+rodney open https://example.com    # Navigate to URL (waits for the load event)
 rodney open example.com            # http:// prefix added automatically
 rodney back                        # Go back
 rodney forward                     # Go forward
@@ -60,6 +63,23 @@ rodney reload                      # Reload page
 rodney reload --hard               # Reload bypassing cache
 rodney clear-cache                 # Clear the browser cache
 ```
+
+`open` waits for the `load` event by default. On pages that never fire it
+(SPAs, long-poll, bot-hostile sites), use the wait/timeout options instead of
+hanging:
+
+```bash
+rodney open https://spa.app --no-wait                # Return immediately; poll the DOM yourself
+rodney open https://spa.app --wait domcontentloaded  # Wait for DOMContentLoaded, not full load
+rodney open https://slow.app --timeout 5             # Cap the wait at N seconds
+rodney open https://api.example --expect-ok          # Exit non-zero on HTTP status >= 400
+rodney open https://example.com --then-js 'document.title'  # Navigate, wait, eval, print — one process
+rodney open https://example.com --user-agent "Custom UA/1.0"
+```
+
+When a page or tab crashes the renderer, commands fail with a one-line error
+(and a hint to restart) rather than a Go stack trace. Set `RODNEY_DEBUG=1` to
+see the full trace for development.
 
 ### Extract information
 
@@ -81,9 +101,14 @@ rodney js "1 + 2"                               # Math
 rodney js 'document.querySelector("h1").textContent'  # DOM queries
 rodney js '[1,2,3].map(x => x * 2)'            # Returns pretty-printed JSON
 rodney js 'document.querySelectorAll("a").length'     # Count elements
+rodney js --json 'document.title'              # Always valid JSON (quoted) — pipe to jq/jaq
+rodney js --timeout 5 'slowThing()'            # Override the eval timeout
 ```
 
-The expression is automatically wrapped in `() => { return (expr); }`.
+The expression is automatically wrapped in `() => { return (expr); }`. By
+default strings print unquoted and objects/arrays pretty-print as JSON; pass
+`--json` to `JSON.stringify` the result so the output is *always* valid JSON
+(handy for piping into `jq`/`jaq`).
 
 ### Interact with elements
 
@@ -110,6 +135,10 @@ rodney waitstable           # Wait for DOM to stop changing
 rodney waitidle             # Wait for network to be idle
 rodney sleep 2.5            # Sleep for N seconds
 ```
+
+The `open`, `text`, `js`, `wait`, `waitload`, `waitstable`, `waitidle`, and
+`reload` commands all accept `--timeout SEC` to override the default 30s
+(`ROD_TIMEOUT`) timeout per invocation.
 
 ### Screenshots
 
@@ -366,7 +395,8 @@ This pattern is useful in CI — run Rodney as a post-deploy check, an accessibi
 |---|---|---|
 | `RODNEY_HOME` | `~/.rodney` | Data directory for state and Chrome profile |
 | `ROD_CHROME_BIN` | `/usr/bin/google-chrome` | Path to Chrome/Chromium binary |
-| `ROD_TIMEOUT` | `30` | Default timeout in seconds for element queries |
+| `ROD_TIMEOUT` | `30` | Default timeout in seconds for element queries and waits |
+| `RODNEY_DEBUG` | (unset) | When set, print full Go stack traces instead of clean errors |
 | `HTTPS_PROXY` / `HTTP_PROXY` | (none) | Authenticated proxy auto-detected on start |
 
 Global state is stored in `~/.rodney/state.json` with Chrome user data in `~/.rodney/chrome-data/`. When using `--local`, state is stored in `./.rodney/state.json` and `./.rodney/chrome-data/` in the current directory instead. Set `RODNEY_HOME` to override the default global directory.
@@ -394,6 +424,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 - **Element queries** use rod's built-in auto-wait with a configurable timeout (default 30s)
 - **JS evaluation** wraps user expressions in arrow functions as required by rod's `Eval`
 - **Accessibility commands** call CDP's Accessibility domain directly via rod's `proto` package (`getFullAXTree`, `queryAXTree`, `getPartialAXTree`)
+- **Graceful failure** — a top-level `recover()` turns any internal panic into a clean `error: …` + exit 2 (`RODNEY_DEBUG=1` restores the full trace), and navigation commands apply the timeout and add a restart hint when the browser session has died
 
 ## Dependencies
 
@@ -403,22 +434,23 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 
 | Command | Arguments | Description |
 |---|---|---|
-| `start` | `[--show] [--insecure\|-k]` | Launch Chrome (headless by default, `--show` for visible) |
+| `start` | `[--show] [--insecure\|-k] [--user-agent UA] [--stealth]` | Launch Chrome (headless by default, `--show` for visible) |
 | `connect` | `<host:port>` | Connect to existing Chrome on remote debug port |
 | `stop` | | Shut down Chrome |
-| `status` | | Show browser status |
-| `open` | `<url>` | Navigate to URL |
+| `status` | | Show browser status (includes version) |
+| `version` | | Print version |
+| `open` | `<url> [--no-wait] [--wait MODE] [--timeout SEC] [--expect-ok] [--then-js EXPR] [--user-agent UA]` | Navigate to URL (`MODE`: `load`\|`domcontentloaded`\|`none`) |
 | `back` | | Go back in history |
 | `forward` | | Go forward in history |
-| `reload` | `[--hard]` | Reload page (`--hard` bypasses cache) |
+| `reload` | `[--hard] [--timeout SEC]` | Reload page (`--hard` bypasses cache) |
 | `clear-cache` | | Clear the browser cache |
 | `url` | | Print current URL |
 | `title` | | Print page title |
 | `html` | `[selector]` | Print HTML (page or element) |
-| `text` | `<selector>` | Print element text content |
+| `text` | `<selector> [--timeout SEC]` | Print element text content |
 | `attr` | `<selector> <name>` | Print attribute value |
 | `pdf` | `[file]` | Save page as PDF |
-| `js` | `<expression>` | Evaluate JavaScript |
+| `js` | `[--timeout SEC] [--json] <expression>` | Evaluate JavaScript (`--json` for always-valid JSON) |
 | `click` | `<selector>` | Click element |
 | `input` | `<selector> <text>` | Type into input |
 | `clear` | `<selector>` | Clear input |
@@ -428,10 +460,10 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `submit` | `<selector>` | Submit form |
 | `hover` | `<selector>` | Hover over element |
 | `focus` | `<selector>` | Focus element |
-| `wait` | `<selector>` | Wait for element to appear |
-| `waitload` | | Wait for page load |
-| `waitstable` | | Wait for DOM stability |
-| `waitidle` | | Wait for network idle |
+| `wait` | `<selector> [--timeout SEC]` | Wait for element to appear |
+| `waitload` | `[--timeout SEC]` | Wait for page load |
+| `waitstable` | `[--timeout SEC]` | Wait for DOM stability |
+| `waitidle` | `[--timeout SEC]` | Wait for network idle |
 | `sleep` | `<seconds>` | Sleep N seconds |
 | `screenshot` | `[-w N] [-h N] [file]` | Page screenshot (optional viewport size) |
 | `screenshot-el` | `<selector> [file]` | Element screenshot |
