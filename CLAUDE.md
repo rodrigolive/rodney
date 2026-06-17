@@ -36,7 +36,8 @@ first time a transform calls for it.
 ## Recipes
 
 ```
-just ok          # gate: tidy + fmt + vet + lint + test + build
+just ok          # gate: tidy + fmt + vet + lint + test + build + install
+just install     # install rodney into ~/go/bin as the system binary (version-stamped)
 just run ARGS    # run from source, e.g. `just run open https://example.com`
 just test        # full suite (TestMain boots one headless Chrome, ~8s)
 just test-race   # race detector

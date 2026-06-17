@@ -5,6 +5,12 @@ ldflags := "-s -w -X main.version=" + version
 build:
     go build -trimpath -ldflags="{{ldflags}}" -o rodney .
 
+# Install rodney as the system binary into $GOBIN (defaults to ~/go/bin, which
+# is on PATH), version-stamped from git. Part of the `ok` gate.
+install:
+    go install -trimpath -ldflags="{{ldflags}}" .
+    @bin="$(go env GOBIN)"; [ -n "$bin" ] || bin="$(go env GOPATH)/bin"; echo "installed rodney -> $bin/rodney"
+
 tidy:
     go mod tidy
 
@@ -43,8 +49,8 @@ run *ARGS:
 # Local pre-commit gate — run after every change.
 check: tidy fmt vet lint test build
 
-ok: check
-    @echo "All checks passed."
+ok: check install
+    @echo "All checks passed; rodney installed as the system binary."
 
 # CI gate — verify-only (no file writes). Mirrors `check` so local and CI
 # can't drift: add a step here and .github/workflows/check.yml picks it up.

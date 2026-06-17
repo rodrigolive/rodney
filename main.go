@@ -181,6 +181,17 @@ func findUnknownFlag(args []string, fs *flag.FlagSet) string {
 }
 
 func main() {
+	// Convert any Must*-style panic into a clean `error: …` + exit 2 so agents
+	// scripting rodney never get a raw Go stack trace. RODNEY_DEBUG=1 skips the
+	// guard so the full trace is preserved for development.
+	if os.Getenv("RODNEY_DEBUG") == "" {
+		defer func() {
+			if r := recover(); r != nil {
+				fatal("%v", r)
+			}
+		}()
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(2)
@@ -314,9 +325,15 @@ func init() {
 	}
 }
 
-// withPage loads state, connects, and returns the active page.
-// Caller should NOT close the browser (we just disconnect).
+// withPage loads state, connects, and returns the active page with the default
+// timeout applied. Caller should NOT close the browser (we just disconnect).
 func withPage() (*State, *rod.Browser, *rod.Page) {
+	return withPageTimeout(defaultTimeout)
+}
+
+// withPageTimeout is like withPage but applies a caller-chosen timeout so
+// element queries and waits don't hang forever.
+func withPageTimeout(timeout time.Duration) (*State, *rod.Browser, *rod.Page) {
 	s, err := loadState()
 	if err != nil {
 		fatal("%v", err)
@@ -329,9 +346,102 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	// Apply default timeout so element queries don't hang forever
-	page = page.Timeout(defaultTimeout)
-	return s, browser, page
+	return s, browser, page.Timeout(timeout)
+}
+
+// parseFlagsInterspersed parses fs against args where flags and positional
+// arguments may appear in any order (a plain flag.FlagSet stops at the first
+// non-flag). Returns the positional args in their original order.
+func parseFlagsInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			break
+		}
+		positionals = append(positionals, args[0])
+		args = args[1:]
+	}
+	return positionals, nil
+}
+
+// resolveTimeout returns the page timeout to use: the --timeout flag value (in
+// seconds) when positive, otherwise the global defaultTimeout.
+func resolveTimeout(flagSecs float64) time.Duration {
+	if flagSecs > 0 {
+		return time.Duration(flagSecs * float64(time.Second))
+	}
+	return defaultTimeout
+}
+
+// parseTimeoutArgs extracts an optional --timeout <sec> flag (which may appear
+// anywhere among args) and returns the resolved page timeout plus the remaining
+// positional args. On an unknown flag it prints usage and exits.
+func parseTimeoutArgs(name string, args []string) (time.Duration, []string) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	secs := fs.Float64("timeout", 0, "")
+	positionals, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		fatal("unknown flag: %s", findUnknownFlag(args, fs))
+	}
+	return resolveTimeout(*secs), positionals
+}
+
+// navHint returns an actionable suffix when err looks like the browser
+// connection died (e.g. a crashed tab took the whole session down), else "".
+func navHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	for _, sig := range []string{"EOF", "use of closed", "connection refused", "websocket"} {
+		if strings.Contains(msg, sig) {
+			return "; the browser may have crashed — run 'rodney start' to restart it"
+		}
+	}
+	return ""
+}
+
+// waitPageReady blocks until the page reaches the given readiness, honoring the
+// page's timeout. mode is "load" (default), "domcontentloaded", or "none".
+func waitPageReady(page *rod.Page, mode string) error {
+	switch mode {
+	case "none":
+		return nil
+	case "", "load":
+		return page.WaitLoad()
+	case "domcontentloaded":
+		_, err := page.Evaluate(rod.Eval(`() => new Promise(resolve => {
+			if (document.readyState !== 'loading') { resolve(true); return; }
+			document.addEventListener('DOMContentLoaded', () => resolve(true), { once: true });
+		})`).ByPromise())
+		return err
+	default:
+		return fmt.Errorf("invalid wait mode %q (want load, domcontentloaded, or none)", mode)
+	}
+}
+
+// navigateCapturingStatus navigates to url and returns the HTTP status of the
+// main document response (0 if it could not be observed within the page timeout).
+func navigateCapturingStatus(page *rod.Page, url string) (int, error) {
+	_ = proto.NetworkEnable{}.Call(page)
+	var status int
+	wait := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
+		if e.Type == proto.NetworkResourceTypeDocument && e.Response != nil {
+			status = e.Response.Status
+			return true
+		}
+		return false
+	})
+	if err := page.Navigate(url); err != nil {
+		return 0, err
+	}
+	wait()
+	return status, nil
 }
 
 // --- Commands ---
@@ -552,12 +662,36 @@ func cmdStatus(args []string) {
 	}
 }
 
+const openUsage = "usage: rodney open <url> [--no-wait] [--wait load|domcontentloaded|none] [--timeout SEC] [--expect-ok]"
+
 func cmdOpen(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney open <url>")
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	noWait := fs.Bool("no-wait", false, "")
+	waitMode := fs.String("wait", "load", "")
+	timeoutSecs := fs.Float64("timeout", 0, "")
+	expectOK := fs.Bool("expect-ok", false, "")
+
+	positionals, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		fatal("unknown flag: %s\n%s", findUnknownFlag(args, fs), openUsage)
 	}
-	url := args[0]
-	// Add scheme if missing
+	if len(positionals) < 1 {
+		fatal("%s", openUsage)
+	}
+
+	mode := *waitMode
+	if *noWait {
+		mode = "none"
+	}
+	switch mode {
+	case "none", "load", "domcontentloaded":
+	default:
+		fatal("invalid --wait %q (want load, domcontentloaded, or none)", mode)
+	}
+	timeout := resolveTimeout(*timeoutSecs)
+
+	url := positionals[0]
 	if !strings.Contains(url, "://") {
 		url = "http://" + url
 	}
@@ -571,11 +705,15 @@ func cmdOpen(args []string) {
 		fatal("%v", err)
 	}
 
-	// If no pages exist, create one
+	// Ensure there's a page to navigate, creating a blank one if none exist, so
+	// the navigation path (and status capture) is uniform.
 	pages, _ := browser.Pages()
 	var page *rod.Page
 	if len(pages) == 0 {
-		page = browser.MustPage(url)
+		page, err = browser.Page(proto.TargetCreateTarget{})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
 		s.ActivePage = 0
 		_ = saveState(s)
 	} else {
@@ -583,11 +721,34 @@ func cmdOpen(args []string) {
 		if err != nil {
 			fatal("%v", err)
 		}
-		if err := page.Navigate(url); err != nil {
-			fatal("navigation failed: %v", err)
+	}
+	page = page.Timeout(timeout)
+
+	// Capture the document status only when --expect-ok asks for it (it adds a
+	// NetworkResponseReceived round-trip we don't want on the common path).
+	var status int
+	if *expectOK {
+		status, err = navigateCapturingStatus(page, url)
+	} else {
+		err = page.Navigate(url)
+	}
+	if err != nil {
+		fatal("navigation failed: %v%s", err, navHint(err))
+	}
+
+	if err := waitPageReady(page, mode); err != nil {
+		fatal("page did not finish loading within %s: %v%s", timeout, err, navHint(err))
+	}
+
+	if *expectOK {
+		if status >= 400 {
+			fatal("HTTP %d response from %s", status, url)
+		}
+		if status > 0 {
+			fmt.Fprintf(os.Stderr, "HTTP %d\n", status)
 		}
 	}
-	page.MustWaitLoad()
+
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.Title)
@@ -596,8 +757,12 @@ func cmdOpen(args []string) {
 
 func cmdBack(args []string) {
 	_, _, page := withPage()
-	page.MustNavigateBack()
-	page.MustWaitLoad()
+	if err := page.NavigateBack(); err != nil {
+		fatal("back failed: %v%s", err, navHint(err))
+	}
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+	}
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.URL)
@@ -606,8 +771,12 @@ func cmdBack(args []string) {
 
 func cmdForward(args []string) {
 	_, _, page := withPage()
-	page.MustNavigateForward()
-	page.MustWaitLoad()
+	if err := page.NavigateForward(); err != nil {
+		fatal("forward failed: %v%s", err, navHint(err))
+	}
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+	}
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.URL)
@@ -618,20 +787,25 @@ func cmdReload(args []string) {
 	fs := flag.NewFlagSet("reload", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	hard := fs.Bool("hard", false, "")
+	timeoutSecs := fs.Float64("timeout", 0, "")
 	if err := fs.Parse(args); err != nil {
-		fatal("%v", err)
+		fatal("unknown flag: %s\nusage: rodney reload [--hard] [--timeout SEC]", findUnknownFlag(args, fs))
 	}
-	_, _, page := withPage()
+	timeout := resolveTimeout(*timeoutSecs)
+	_, _, page := withPageTimeout(timeout)
 	if *hard {
 		// CDP Page.reload with ignoreCache (equivalent to Shift+Refresh)
-		err := (proto.PageReload{IgnoreCache: true}).Call(page)
-		if err != nil {
-			fatal("reload failed: %v", err)
+		if err := (proto.PageReload{IgnoreCache: true}).Call(page); err != nil {
+			fatal("reload failed: %v%s", err, navHint(err))
 		}
 	} else {
-		page.MustReload()
+		if err := page.Reload(); err != nil {
+			fatal("reload failed: %v%s", err, navHint(err))
+		}
 	}
-	page.MustWaitLoad()
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Reloaded")
 }
 
@@ -681,11 +855,12 @@ func cmdHTML(args []string) {
 }
 
 func cmdText(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney text <selector>")
+	timeout, pos := parseTimeoutArgs("text", args)
+	if len(pos) < 1 {
+		fatal("usage: rodney text <selector> [--timeout SEC]")
 	}
-	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	_, _, page := withPageTimeout(timeout)
+	el, err := page.Element(pos[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
@@ -742,11 +917,20 @@ func cmdPDF(args []string) {
 }
 
 func cmdJS(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney js <expression>")
+	// Flags must precede the expression (a JS expression can start with '-');
+	// use '--' to pass such an expression literally.
+	fs := flag.NewFlagSet("js", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	timeoutSecs := fs.Float64("timeout", 0, "")
+	if err := fs.Parse(args); err != nil {
+		fatal("unknown flag: %s\nusage: rodney js [--timeout SEC] <expression>", findUnknownFlag(args, fs))
 	}
-	expr := strings.Join(args, " ")
-	_, _, page := withPage()
+	rest := fs.Args()
+	if len(rest) < 1 {
+		fatal("usage: rodney js [--timeout SEC] <expression>")
+	}
+	expr := strings.Join(rest, " ")
+	_, _, page := withPageTimeout(resolveTimeout(*timeoutSecs))
 
 	// Wrap bare expressions in a function
 	js := fmt.Sprintf(`() => { return (%s); }`, expr)
@@ -1076,33 +1260,45 @@ func cmdFocus(args []string) {
 }
 
 func cmdWait(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney wait <selector>")
+	timeout, pos := parseTimeoutArgs("wait", args)
+	if len(pos) < 1 {
+		fatal("usage: rodney wait <selector> [--timeout SEC]")
 	}
-	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	_, _, page := withPageTimeout(timeout)
+	el, err := page.Element(pos[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
-	el.MustWaitVisible()
+	if err := el.WaitVisible(); err != nil {
+		fatal("element did not become visible within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Element visible")
 }
 
 func cmdWaitLoad(args []string) {
-	_, _, page := withPage()
-	page.MustWaitLoad()
+	timeout, _ := parseTimeoutArgs("waitload", args)
+	_, _, page := withPageTimeout(timeout)
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Page loaded")
 }
 
 func cmdWaitStable(args []string) {
-	_, _, page := withPage()
-	page.MustWaitStable()
+	timeout, _ := parseTimeoutArgs("waitstable", args)
+	_, _, page := withPageTimeout(timeout)
+	if err := page.WaitStable(time.Second); err != nil {
+		fatal("DOM did not stabilize within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("DOM stable")
 }
 
 func cmdWaitIdle(args []string) {
-	_, _, page := withPage()
-	page.MustWaitIdle()
+	timeout, _ := parseTimeoutArgs("waitidle", args)
+	_, _, page := withPageTimeout(timeout)
+	if err := page.WaitIdle(timeout); err != nil {
+		fatal("network did not become idle within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Network idle")
 }
 
@@ -1287,10 +1483,19 @@ func cmdNewPage(args []string) {
 
 	var page *rod.Page
 	if url != "" {
-		page = browser.MustPage(url)
-		page.MustWaitLoad()
+		page, err = browser.Page(proto.TargetCreateTarget{URL: url})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
+		page = page.Timeout(defaultTimeout)
+		if err := page.WaitLoad(); err != nil {
+			fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+		}
 	} else {
-		page = browser.MustPage("")
+		page, err = browser.Page(proto.TargetCreateTarget{})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
 	}
 
 	// Switch active to the new page

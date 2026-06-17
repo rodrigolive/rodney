@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -51,6 +52,9 @@ func TestMain(m *testing.M) {
 	mux.HandleFunc("/download", handleDownload)
 	mux.HandleFunc("/testfile.txt", handleTestFile)
 	mux.HandleFunc("/empty", handleEmpty)
+	mux.HandleFunc("/slow", handleSlow)
+	mux.HandleFunc("/hang", handleHang)
+	mux.HandleFunc("/notfound", handleNotFound)
 	server := httptest.NewServer(mux)
 
 	env = &testEnv{browser: browser, server: server}
@@ -148,6 +152,31 @@ func handleEmpty(w http.ResponseWriter, r *http.Request) {
 <head><title>Empty Page</title></head>
 <body></body>
 </html>`))
+}
+
+// handleSlow serves HTML whose only subresource (an image) hangs, so the DOM
+// parses (DOMContentLoaded fires) but the `load` event never arrives.
+func handleSlow(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html lang="en">
+<head><title>Slow Page</title></head>
+<body><h1>Slow</h1><img src="/hang"></body>
+</html>`))
+}
+
+// handleHang never responds, holding the request open until the client (Chrome)
+// cancels it — used to keep handleSlow's `load` event pending.
+func handleHang(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-time.After(30 * time.Second):
+	case <-r.Context().Done():
+	}
+}
+
+func handleNotFound(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte("not found"))
 }
 
 // --- Helper: navigate to a fixture and return the page ---
@@ -1223,4 +1252,129 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 			t.Errorf("expected page to load successfully with title 'Secure Test', got %q", title)
 		}
 	})
+}
+
+// =====================
+// flag / helper tests
+// =====================
+
+func TestParseFlagsInterspersed_FlagsAfterPositional(t *testing.T) {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	noWait := fs.Bool("no-wait", false, "")
+	wait := fs.String("wait", "load", "")
+
+	pos, err := parseFlagsInterspersed(fs, []string{"https://example.com", "--no-wait", "--wait", "none"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pos) != 1 || pos[0] != "https://example.com" {
+		t.Errorf("expected positional [https://example.com], got %v", pos)
+	}
+	if !*noWait {
+		t.Error("expected --no-wait to parse even after the positional")
+	}
+	if *wait != "none" {
+		t.Errorf("expected --wait none, got %q", *wait)
+	}
+}
+
+func TestParseFlagsInterspersed_FlagsBeforePositional(t *testing.T) {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	secs := fs.Float64("timeout", 0, "")
+
+	pos, err := parseFlagsInterspersed(fs, []string{"--timeout", "5", "https://example.com"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *secs != 5 {
+		t.Errorf("expected --timeout 5, got %v", *secs)
+	}
+	if len(pos) != 1 || pos[0] != "https://example.com" {
+		t.Errorf("expected positional [https://example.com], got %v", pos)
+	}
+}
+
+func TestParseFlagsInterspersed_UnknownFlag(t *testing.T) {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if _, err := parseFlagsInterspersed(fs, []string{"https://example.com", "--bogus"}); err == nil {
+		t.Error("expected an error for an unknown flag")
+	}
+}
+
+func TestResolveTimeout(t *testing.T) {
+	if got := resolveTimeout(0); got != defaultTimeout {
+		t.Errorf("0 should resolve to defaultTimeout %v, got %v", defaultTimeout, got)
+	}
+	if got := resolveTimeout(2.5); got != 2500*time.Millisecond {
+		t.Errorf("2.5 should resolve to 2.5s, got %v", got)
+	}
+}
+
+func TestNavHint(t *testing.T) {
+	for _, msg := range []string{"read tcp: EOF", "use of closed network connection", "connection refused"} {
+		if navHint(fmt.Errorf("%s", msg)) == "" {
+			t.Errorf("error %q should produce a restart hint", msg)
+		}
+	}
+	if navHint(fmt.Errorf("element not found")) != "" {
+		t.Error("an ordinary error should produce no hint")
+	}
+}
+
+// =====================
+// wait-mode / status (integration)
+// =====================
+
+func TestWaitPageReady_NoneReturnsImmediately(t *testing.T) {
+	page := env.browser.MustPage(env.server.URL + "/slow")
+	t.Cleanup(func() { page.MustClose() })
+	if err := waitPageReady(page.Timeout(2*time.Second), "none"); err != nil {
+		t.Errorf("mode none should not wait: %v", err)
+	}
+}
+
+func TestWaitPageReady_DOMContentLoadedOnSlowPage(t *testing.T) {
+	page := env.browser.MustPage(env.server.URL + "/slow")
+	t.Cleanup(func() { page.MustClose() })
+	// DOMContentLoaded fires once the HTML is parsed, before the hanging image.
+	if err := waitPageReady(page.Timeout(5*time.Second), "domcontentloaded"); err != nil {
+		t.Errorf("domcontentloaded should resolve on a page with a hanging subresource: %v", err)
+	}
+}
+
+func TestWaitPageReady_LoadTimesOutOnSlowPage(t *testing.T) {
+	page := env.browser.MustPage(env.server.URL + "/slow")
+	t.Cleanup(func() { page.MustClose() })
+	// The `load` event never fires (image hangs), so this must return an error
+	// rather than hang or panic.
+	if err := waitPageReady(page.Timeout(2*time.Second), "load"); err == nil {
+		t.Error("load should time out while the image request hangs")
+	}
+}
+
+func TestNavigateCapturingStatus_OK(t *testing.T) {
+	page := env.browser.MustPage("")
+	t.Cleanup(func() { page.MustClose() })
+	status, err := navigateCapturingStatus(page.Timeout(10*time.Second), env.server.URL+"/empty")
+	if err != nil {
+		t.Fatalf("navigate failed: %v", err)
+	}
+	if status != 200 {
+		t.Errorf("expected HTTP 200, got %d", status)
+	}
+}
+
+func TestNavigateCapturingStatus_NotFound(t *testing.T) {
+	page := env.browser.MustPage("")
+	t.Cleanup(func() { page.MustClose() })
+	status, err := navigateCapturingStatus(page.Timeout(10*time.Second), env.server.URL+"/notfound")
+	if err != nil {
+		t.Fatalf("navigate failed: %v", err)
+	}
+	if status != 404 {
+		t.Errorf("expected HTTP 404, got %d", status)
+	}
 }
