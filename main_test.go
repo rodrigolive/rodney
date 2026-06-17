@@ -768,6 +768,126 @@ func TestResolveStateDir_LocalUsesWorkingDir(t *testing.T) {
 }
 
 // =====================
+// Multi-agent: session + target addressing
+// =====================
+
+func TestExtractValueFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		flag    string
+		wantVal string
+		wantLen int
+	}{
+		{"separate", []string{"open", "--session", "a1", "url"}, "--session", "a1", 2},
+		{"equals", []string{"--session=a2", "status"}, "--session", "a2", 1},
+		{"absent", []string{"open", "url"}, "--session", "", 2},
+		{"last wins", []string{"--target", "x", "js", "--target", "y"}, "--target", "y", 1},
+		{"trailing no value", []string{"status", "--session"}, "--session", "", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			val, rest := extractValueFlag(tt.args, tt.flag)
+			if val != tt.wantVal {
+				t.Errorf("value = %q, want %q", val, tt.wantVal)
+			}
+			if len(rest) != tt.wantLen {
+				t.Errorf("rest = %v (len %d), want len %d", rest, len(rest), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestStateDir_Session(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RODNEY_HOME", dir)
+	activeSession = "agent7"
+	t.Cleanup(func() { activeSession = "" })
+	want := filepath.Join(dir, "sessions", "agent7")
+	if got := stateDir(); got != want {
+		t.Errorf("stateDir() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeSession(t *testing.T) {
+	for _, in := range []string{"../escape", "a/b", `a\b`, "../../etc"} {
+		got := sanitizeSession(in)
+		if strings.ContainsAny(got, `/\`) || strings.Contains(got, "..") {
+			t.Errorf("sanitizeSession(%q) = %q still contains a path separator or ..", in, got)
+		}
+	}
+}
+
+func TestMatchTargetID(t *testing.T) {
+	ids := []string{"AAAA1111", "AAAA2222", "BBBB3333"}
+	tests := []struct {
+		name    string
+		query   string
+		wantIdx int
+		wantErr bool
+	}{
+		{"exact", "BBBB3333", 2, false},
+		{"unique prefix", "BBBB", 2, false},
+		{"ambiguous prefix", "AAAA", -1, true},
+		{"no match", "ZZZZ", -1, true},
+		{"exact beats prefix", "AAAA1111", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx, err := matchTargetID(ids, tt.query)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if idx != tt.wantIdx {
+				t.Errorf("idx = %d, want %d", idx, tt.wantIdx)
+			}
+		})
+	}
+}
+
+func TestSuggestCommand(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"clik", "click"},
+		{"opne", "open"},
+		{"scrnshot", "screenshot"}, // distance 2 (two dropped 'e's)
+		{"sttus", "status"},
+		{"xyzzy", ""},   // too far from anything
+		{"zzzzzzz", ""}, // too far from anything
+	}
+	for _, tt := range tests {
+		if got := suggestCommand(tt.input, commandNames); got != tt.want {
+			t.Errorf("suggestCommand(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestSaveStateAtomic_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RODNEY_HOME", dir)
+	in := &State{DebugURL: "ws://x", ChromePID: 42, ActiveTarget: "TID123", ActivePage: 1}
+	if err := saveState(in); err != nil {
+		t.Fatalf("saveState: %v", err)
+	}
+	out, err := loadState()
+	if err != nil {
+		t.Fatalf("loadState: %v", err)
+	}
+	if out.ActiveTarget != "TID123" || out.ChromePID != 42 {
+		t.Errorf("round-trip mismatch: %+v", out)
+	}
+	// No leftover temp files should remain in the state dir.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file: %s", e.Name())
+		}
+	}
+}
+
+// =====================
 // RODNEY_HOME env var tests
 // =====================
 
@@ -1186,6 +1306,22 @@ func TestParseStartArgs_UserAgentAndStealth(t *testing.T) {
 	}
 	if opts.userAgent != "Custom/1.0" {
 		t.Errorf("expected userAgent=Custom/1.0, got %q", opts.userAgent)
+	}
+}
+
+func TestParseStartArgs_Replace(t *testing.T) {
+	for _, flag := range []string{"--replace", "--force"} {
+		opts, err := parseStartArgs([]string{flag})
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", flag, err)
+		}
+		if !opts.replace {
+			t.Errorf("%s should set replace=true", flag)
+		}
+	}
+	opts, _ := parseStartArgs([]string{})
+	if opts.replace {
+		t.Error("replace should default to false")
 	}
 }
 

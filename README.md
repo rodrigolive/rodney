@@ -152,12 +152,18 @@ rodney screenshot-el ".chart" chart.png   # Screenshot specific element
 ### Manage tabs
 
 ```bash
-rodney pages                    # List all tabs (* marks active)
-rodney newpage https://...      # Open URL in new tab
+rodney pages                    # List all tabs (* marks active; shows target id)
+rodney newpage https://...      # Open URL in new tab; prints "target: <id>"
 rodney page 1                   # Switch to tab by index
-rodney closepage 1              # Close tab by index
+rodney page <target-id>         # ...or by stable target id
+rodney closepage 1              # Close tab by index or target id
 rodney closepage                # Close active tab
 ```
+
+Tabs are listed in a stable order (sorted by target id) so an index maps to the
+same tab across calls as long as no tab opens or closes. Target ids never shift —
+prefer them for reliable multi-step or multi-agent scripts (see
+[Running multiple agents in parallel](#running-multiple-agents-in-parallel)).
 
 ### Query elements
 
@@ -232,6 +238,57 @@ rodney open --global https://example.com
 ```
 
 Add `.rodney/` to your `.gitignore` to keep session state out of version control.
+
+### Running multiple agents in parallel
+
+Rodney is designed to be driven by several agents at once without their commands
+interfering. There are two models; pick based on whether the agents should share
+cookies/session.
+
+**Multiple connections are not a `rod` limitation** — every rodney command opens
+its own short-lived CDP connection to Chrome, and Chrome happily serves many at
+once. The only thing that must not be shared blindly is the *active tab* pointer,
+which is why the two patterns below exist.
+
+#### 1. Isolation — one Chrome per agent (simplest, recommended)
+
+Give each agent its own state directory (and therefore its own Chrome instance,
+cookies, and tabs) with `RODNEY_SESSION` (or the `--session NAME` flag). Set it
+once per agent and use rodney exactly as normal — nothing else changes:
+
+```bash
+export RODNEY_SESSION=agent-1   # each agent picks a unique name
+rodney start
+rodney open https://example.com
+rodney text h1
+rodney stop
+```
+
+State lives under `~/.rodney/sessions/agent-1/`. Agents never share a tab pointer,
+so nothing can conflict. The cost is one Chrome process per agent.
+
+#### 2. Shared browser — one Chrome, a tab per agent
+
+When agents should share one browser (and its cookies), have each agent open its
+own tab and pin every subsequent command to that tab's **stable target id** with
+`RODNEY_TARGET` (or `--target ID`):
+
+```bash
+rodney start
+id=$(rodney newpage https://example.com | sed -n 's/^target: //p')  # capture the tab id
+RODNEY_TARGET=$id rodney open https://example.com/login
+RODNEY_TARGET=$id rodney click "#submit"
+RODNEY_TARGET=$id rodney text ".result"
+```
+
+Target ids are printed by `rodney newpage` (as `target: <id>`) and `rodney pages`,
+and stay valid for the life of the tab. Because each agent addresses its own tab
+explicitly, two agents can interleave commands freely without clobbering each
+other's "current tab".
+
+> Tab indices (`rodney page 1`) are sorted by target id so they stay consistent
+> between calls, but they still shift when tabs open or close. For robust
+> multi-step or multi-agent work, prefer the target id.
 
 ### Shell scripting examples
 
@@ -394,6 +451,8 @@ This pattern is useful in CI — run Rodney as a post-deploy check, an accessibi
 | Environment Variable | Default | Description |
 |---|---|---|
 | `RODNEY_HOME` | `~/.rodney` | Data directory for state and Chrome profile |
+| `RODNEY_SESSION` | (unset) | Isolate state under `sessions/<name>/` — each agent gets its own Chrome |
+| `RODNEY_TARGET` | (unset) | Operate on the tab with this target id (shared-browser parallelism) |
 | `ROD_CHROME_BIN` | `/usr/bin/google-chrome` | Path to Chrome/Chromium binary |
 | `ROD_TIMEOUT` | `30` | Default timeout in seconds for element queries and waits |
 | `RODNEY_DEBUG` | (unset) | When set, print full Go stack traces instead of clean errors |
@@ -434,7 +493,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 
 | Command | Arguments | Description |
 |---|---|---|
-| `start` | `[--show] [--insecure\|-k] [--user-agent UA] [--stealth]` | Launch Chrome (headless by default, `--show` for visible) |
+| `start` | `[--show] [--insecure\|-k] [--user-agent UA] [--stealth] [--replace]` | Launch Chrome (headless by default; reuses a running session unless `--replace`) |
 | `connect` | `<host:port>` | Connect to existing Chrome on remote debug port |
 | `stop` | | Shut down Chrome |
 | `status` | | Show browser status (includes version) |
@@ -467,10 +526,10 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `sleep` | `<seconds>` | Sleep N seconds |
 | `screenshot` | `[-w N] [-h N] [file]` | Page screenshot (optional viewport size) |
 | `screenshot-el` | `<selector> [file]` | Element screenshot |
-| `pages` | | List tabs |
-| `page` | `<index>` | Switch tab |
-| `newpage` | `[url]` | Open new tab |
-| `closepage` | `[index]` | Close tab |
+| `pages` | | List tabs (with target ids) |
+| `page` | `<index\|target-id>` | Switch tab by index or target id |
+| `newpage` | `[url]` | Open new tab (prints its target id) |
+| `closepage` | `[index\|target-id]` | Close a tab (defaults to active) |
 | `exists` | `<selector>` | Check element exists (exit 1 if not) |
 | `count` | `<selector>` | Count matching elements |
 | `visible` | `<selector>` | Check element visible (exit 1 if not) |
@@ -485,5 +544,9 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 |---|---|
 | `--local` | Use directory-scoped session (`./.rodney/`) |
 | `--global` | Use global session (`~/.rodney/`) |
+| `--session NAME` | Isolate state under `sessions/NAME/` — own Chrome (per-agent) |
+| `--target ID` | Operate on the tab with this target id (shared-browser parallelism) |
 | `--version` | Print version and exit |
 | `--help`, `-h`, `help` | Show help message |
+
+All global flags may appear anywhere in the command (e.g. `rodney open --session a1 example.com`).

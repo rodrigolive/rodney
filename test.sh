@@ -53,6 +53,9 @@ echo "[Browser lifecycle]"
 OUT=$($CLI start 2>&1)
 assert_contains "$OUT" "Chrome started" "start launches Chrome"
 
+OUT=$($CLI start 2>&1)
+assert_contains "$OUT" "already running" "second start reuses (does not kill) session"
+
 OUT=$($CLI status 2>&1)
 assert_contains "$OUT" "Browser running" "status shows running"
 
@@ -167,23 +170,33 @@ test -f /tmp/rod-test-ss.png && pass "screenshot file exists" || fail "screensho
 # --- Tabs ---
 echo "[Tabs]"
 
+# Capture the current (first) tab's stable target id so we can switch back to it
+# regardless of tab ordering.
+FIRST_ID=$($CLI pages 2>&1 | sed -n 's/^\* \[[0-9]*\] \([A-Fa-f0-9]*\) .*/\1/p')
+
 OUT=$($CLI pages 2>&1)
 assert_contains "$OUT" "[0]" "pages lists tabs"
 
-OUT=$($CLI newpage http://127.0.0.1:18080/page2 2>&1)
-assert_contains "$OUT" "Opened" "newpage opens tab"
+NEW=$($CLI newpage http://127.0.0.1:18080/page2 2>&1)
+assert_contains "$NEW" "Opened" "newpage opens tab"
+assert_contains "$NEW" "target:" "newpage prints target id"
+NEW_ID=$(echo "$NEW" | sed -n 's/^target: //p')
 
 OUT=$($CLI title 2>&1)
 assert_eq "$OUT" "Page 2" "new tab is active"
 
-OUT=$($CLI page 0 2>&1)
-assert_contains "$OUT" "Switched" "page switches tab"
+# Read the new tab explicitly by target id, even without it being active
+OUT=$(RODNEY_TARGET="$FIRST_ID" $CLI title 2>&1)
+assert_eq "$OUT" "Test Page" "RODNEY_TARGET reads a specific tab"
+
+OUT=$($CLI page "$FIRST_ID" 2>&1)
+assert_contains "$OUT" "Switched" "page switches tab by target id"
 
 OUT=$($CLI title 2>&1)
 assert_eq "$OUT" "Test Page" "switched back to first tab"
 
-OUT=$($CLI closepage 1 2>&1)
-assert_contains "$OUT" "Closed" "closepage closes tab"
+OUT=$($CLI closepage "$NEW_ID" 2>&1)
+assert_contains "$OUT" "Closed" "closepage closes tab by target id"
 
 # --- Cleanup ---
 echo "[Cleanup]"

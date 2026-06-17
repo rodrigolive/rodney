@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -41,6 +43,48 @@ const (
 
 // activeStateDir is set once at startup based on --local/--global flags.
 var activeStateDir string
+
+// activeSession is set from --session NAME or RODNEY_SESSION. When non-empty it
+// isolates state under <base>/sessions/<name>, giving each agent its own Chrome
+// instance (the recommended pattern for running many agents in parallel).
+var activeSession string
+
+// activeTarget is set from --target ID or RODNEY_TARGET. When non-empty every
+// command operates on the tab with that target id instead of the shared
+// "active page", letting multiple agents share one Chrome without clobbering
+// each other's current tab.
+var activeTarget string
+
+// extractValueFlag removes "--name value" or "--name=value" from args and
+// returns the value (last occurrence wins) plus the remaining args. Used for the
+// global --session/--target flags, which may appear anywhere in the command.
+func extractValueFlag(args []string, name string) (string, []string) {
+	value := ""
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == name:
+			if i+1 < len(args) {
+				value = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, name+"="):
+			value = a[len(name)+1:]
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return value, rest
+}
+
+// sanitizeSession keeps a session name from escaping the sessions/ directory.
+func sanitizeSession(name string) string {
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "\\", "_")
+	name = strings.ReplaceAll(name, "..", "_")
+	return name
+}
 
 // extractScopeArgs scans args for --local/--global, removes them, and returns the mode.
 // If both appear, the last one wins.
@@ -80,15 +124,17 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL   string `json:"debug_url"`
-	ChromePID  int    `json:"chrome_pid"`
-	ActivePage int    `json:"active_page"` // index into pages list
-	DataDir    string `json:"data_dir"`
-	ProxyPID   int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort  int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL     string `json:"debug_url"`
+	ChromePID    int    `json:"chrome_pid"`
+	ActivePage   int    `json:"active_page"`             // legacy: index into the (stably sorted) pages list
+	ActiveTarget string `json:"active_target,omitempty"` // stable target id of the active tab
+	DataDir      string `json:"data_dir"`
+	ProxyPID     int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
+	ProxyPort    int    `json:"proxy_port,omitempty"` // local port of auth proxy
 }
 
-func stateDir() string {
+// baseStateDir resolves the data directory before any --session scoping.
+func baseStateDir() string {
 	if dir := os.Getenv("RODNEY_HOME"); dir != "" {
 		return dir
 	}
@@ -97,6 +143,14 @@ func stateDir() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".rodney")
+}
+
+func stateDir() string {
+	base := baseStateDir()
+	if activeSession != "" {
+		return filepath.Join(base, "sessions", sanitizeSession(activeSession))
+	}
+	return base
 }
 
 func statePath() string {
@@ -115,15 +169,37 @@ func loadState() (*State, error) {
 	return &s, nil
 }
 
+// saveState writes state.json atomically (temp file + rename) so a concurrent
+// reader or a second agent writing at the same time can never observe a
+// half-written, corrupt file.
 func saveState(s *State) error {
-	if err := os.MkdirAll(stateDir(), 0755); err != nil {
+	dir := stateDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(statePath(), data, 0644)
+	tmp, err := os.CreateTemp(dir, "state-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, statePath()); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func removeState() {
@@ -139,14 +215,93 @@ func connectBrowser(s *State) (*rod.Browser, error) {
 	return browser, nil
 }
 
-// getActivePage returns the currently active page
-func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
+// orderedPages returns the browser's pages in a stable order (sorted by target
+// id). Chrome's own target ordering is not guaranteed — newly opened tabs can
+// appear first — so without this a positional index like "page 1" would point
+// at different tabs across invocations. Sorting by the immutable target id makes
+// index N map to the same tab as long as the set of tabs is unchanged.
+func orderedPages(browser *rod.Browser) (rod.Pages, error) {
 	pages, err := browser.Pages()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pages: %w", err)
 	}
+	slices.SortFunc(pages, func(a, b *rod.Page) int {
+		return cmp.Compare(string(a.TargetID), string(b.TargetID))
+	})
+	return pages, nil
+}
+
+// matchTargetID resolves a target-id query against the available ids: an exact
+// match wins, otherwise a unique prefix match. The errors are written for an
+// agent to act on (no match / ambiguous), not a stack trace.
+func matchTargetID(ids []string, query string) (int, error) {
+	for i, id := range ids {
+		if id == query {
+			return i, nil
+		}
+	}
+	match := -1
+	for i, id := range ids {
+		if strings.HasPrefix(id, query) {
+			if match >= 0 {
+				return -1, fmt.Errorf("target id %q is ambiguous; use the full id from 'rodney pages'", query)
+			}
+			match = i
+		}
+	}
+	if match < 0 {
+		return -1, fmt.Errorf("no tab with target id %q (run 'rodney pages' to list open tabs)", query)
+	}
+	return match, nil
+}
+
+// targetIDs returns the target ids of pages in order.
+func targetIDs(pages rod.Pages) []string {
+	ids := make([]string, len(pages))
+	for i, p := range pages {
+		ids[i] = string(p.TargetID)
+	}
+	return ids
+}
+
+// pageByTarget finds the page whose target id matches query (exact or unique prefix).
+func pageByTarget(pages rod.Pages, query string) (*rod.Page, error) {
+	idx, err := matchTargetID(targetIDs(pages), query)
+	if err != nil {
+		return nil, err
+	}
+	return pages[idx], nil
+}
+
+// setActivePage records both the stable target id and the legacy index for the
+// chosen tab, so the active tab survives later tabs opening or closing.
+func setActivePage(s *State, pages rod.Pages, idx int) {
+	s.ActivePage = idx
+	if idx >= 0 && idx < len(pages) {
+		s.ActiveTarget = string(pages[idx].TargetID)
+	}
+}
+
+// getActivePage returns the page a command should act on. Resolution order:
+//  1. an explicit per-invocation --target / RODNEY_TARGET override,
+//  2. the stable active target id stored in state (survives reordering),
+//  3. the legacy active-page index, clamped into range.
+func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
+	pages, err := orderedPages(browser)
+	if err != nil {
+		return nil, err
+	}
 	if len(pages) == 0 {
 		return nil, fmt.Errorf("no pages open")
+	}
+	if activeTarget != "" {
+		return pageByTarget(pages, activeTarget)
+	}
+	if s.ActiveTarget != "" {
+		if p, err := pageByTarget(pages, s.ActiveTarget); err == nil {
+			return p, nil
+		}
+		// The stored tab was closed; fall back to the index.
 	}
 	idx := s.ActivePage
 	if idx < 0 || idx >= len(pages) {
@@ -198,8 +353,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Extract --local/--global from all args before dispatching
+	// Extract the global flags (--local/--global, --session, --target) from all
+	// args before dispatching, so they can appear anywhere in the command.
 	mode, cleanedArgs := extractScopeArgs(os.Args[1:])
+	var sessionVal, targetVal string
+	sessionVal, cleanedArgs = extractValueFlag(cleanedArgs, "--session")
+	targetVal, cleanedArgs = extractValueFlag(cleanedArgs, "--target")
+	activeSession = cmp.Or(sessionVal, os.Getenv("RODNEY_SESSION"))
+	activeTarget = cmp.Or(targetVal, os.Getenv("RODNEY_TARGET"))
+
 	if len(cleanedArgs) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -312,9 +474,65 @@ func main() {
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
-		printUsage()
+		if suggestion := suggestCommand(cmd, commandNames); suggestion != "" {
+			fmt.Fprintf(os.Stderr, "did you mean '%s'? run 'rodney help' for all commands\n", suggestion)
+		} else {
+			fmt.Fprintln(os.Stderr, "run 'rodney help' for the list of commands")
+		}
 		os.Exit(2)
 	}
+}
+
+// commandNames lists every dispatchable command, used to suggest a correction
+// when an agent mistypes one.
+var commandNames = []string{
+	"start", "connect", "stop", "status", "version",
+	"open", "back", "forward", "reload", "clear-cache",
+	"url", "title", "html", "text", "attr", "pdf",
+	"js", "click", "input", "clear", "select", "submit", "hover", "file", "download", "focus",
+	"wait", "waitload", "waitstable", "waitidle", "sleep",
+	"screenshot", "screenshot-el",
+	"pages", "page", "newpage", "closepage",
+	"exists", "count", "visible", "assert",
+	"ax-tree", "ax-find", "ax-node",
+	"help",
+}
+
+// suggestCommand returns the closest command name within a small edit distance,
+// or "" when the input is too far from anything to be a useful suggestion.
+func suggestCommand(input string, commands []string) string {
+	best, bestDist := "", -1
+	for _, c := range commands {
+		d := levenshtein(input, c)
+		if bestDist < 0 || d < bestDist {
+			best, bestDist = c, d
+		}
+	}
+	if bestDist >= 0 && bestDist <= 2 {
+		return best
+	}
+	return ""
+}
+
+// levenshtein computes the edit distance between two strings.
+func levenshtein(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
 }
 
 // Default timeout for element queries (seconds)
@@ -511,7 +729,7 @@ func applyStealthFlags(l *launcher.Launcher) {
 
 // --- Commands ---
 
-const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth]"
+const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth] [--replace]"
 
 // startOpts holds the parsed flags for the "start" command.
 type startOpts struct {
@@ -519,6 +737,7 @@ type startOpts struct {
 	headless  bool
 	userAgent string
 	stealth   bool
+	replace   bool
 }
 
 // parseStartArgs parses the flags for the "start" command.
@@ -530,6 +749,8 @@ func parseStartArgs(args []string) (startOpts, error) {
 	fs.BoolVar(&o.insecure, "k", false, "")
 	fs.StringVar(&o.userAgent, "user-agent", "", "")
 	fs.BoolVar(&o.stealth, "stealth", false, "")
+	fs.BoolVar(&o.replace, "replace", false, "")
+	fs.BoolVar(&o.replace, "force", false, "")
 	show := fs.Bool("show", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
@@ -549,13 +770,27 @@ func cmdStart(args []string) {
 	}
 	ignoreCertErrors, headless := opts.insecure, opts.headless
 
-	// Check if already running
+	// If a session already exists, default to reusing it rather than killing it —
+	// re-running `start` must never silently nuke a live browser (and any tabs a
+	// peer agent is using). --replace forces a fresh browser.
 	if s, err := loadState(); err == nil {
-		// Try connecting
 		if b, err := connectBrowser(s); err == nil {
+			if !opts.replace {
+				// Reuse: just disconnect (do NOT Close — that would kill Chrome).
+				fmt.Printf("Chrome already running (PID %d)\n", s.ChromePID)
+				fmt.Printf("Debug URL: %s\n", s.DebugURL)
+				fmt.Println("Reusing the existing session (use 'rodney start --replace' to restart it)")
+				return
+			}
 			b.MustClose()
-			// It was actually running, warn
 			removeState()
+		}
+		// Either we are replacing, or the old browser is dead; clean up any
+		// stale auth-proxy helper before launching a new one.
+		if s.ProxyPID > 0 {
+			if proc, perr := os.FindProcess(s.ProxyPID); perr == nil {
+				_ = proc.Signal(syscall.SIGTERM)
+			}
 		}
 	}
 
@@ -743,10 +978,14 @@ func cmdStatus(args []string) {
 	}
 	pages, _ := browser.Pages()
 	fmt.Printf("Browser running (PID %d)\n", s.ChromePID)
+	fmt.Printf("State dir: %s\n", stateDir())
+	if activeSession != "" {
+		fmt.Printf("Session: %s\n", activeSession)
+	}
 	fmt.Printf("Debug URL: %s\n", s.DebugURL)
 	fmt.Printf("Pages: %d\n", len(pages))
-	fmt.Printf("Active page: %d\n", s.ActivePage)
 	if page, err := getActivePage(browser, s); err == nil {
+		fmt.Printf("Active target: %s\n", page.TargetID)
 		info, _ := page.Info()
 		if info != nil {
 			fmt.Printf("Current: %s - %s\n", info.Title, info.URL)
@@ -808,8 +1047,13 @@ func cmdOpen(args []string) {
 		if err != nil {
 			fatal("failed to open page: %v%s", err, navHint(err))
 		}
-		s.ActivePage = 0
-		_ = saveState(s)
+		// Record the new tab as active by its stable target id (unless the caller
+		// pinned a specific --target, which getActivePage would honor instead).
+		if activeTarget == "" {
+			s.ActivePage = 0
+			s.ActiveTarget = string(page.TargetID)
+			_ = saveState(s)
+		}
 	} else {
 		page, err = getActivePage(browser, s)
 		if err != nil {
@@ -1504,31 +1748,31 @@ func cmdPages(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	pages, err := orderedPages(browser)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
+	}
+	activeID := ""
+	if p, err := getActivePage(browser, s); err == nil {
+		activeID = string(p.TargetID)
 	}
 	for i, p := range pages {
 		marker := " "
-		if i == s.ActivePage {
+		if string(p.TargetID) == activeID {
 			marker = "*"
 		}
 		info, _ := p.Info()
 		if info != nil {
-			fmt.Printf("%s [%d] %s - %s\n", marker, i, info.Title, info.URL)
+			fmt.Printf("%s [%d] %s  %s - %s\n", marker, i, p.TargetID, info.Title, info.URL)
 		} else {
-			fmt.Printf("%s [%d] (unknown)\n", marker, i)
+			fmt.Printf("%s [%d] %s  (unknown)\n", marker, i, p.TargetID)
 		}
 	}
 }
 
 func cmdPage(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney page <index>")
-	}
-	idx, err := strconv.Atoi(args[0])
-	if err != nil {
-		fatal("invalid index: %v", err)
+		fatal("usage: rodney page <index|target-id>")
 	}
 	s, err := loadState()
 	if err != nil {
@@ -1538,14 +1782,23 @@ func cmdPage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	pages, err := orderedPages(browser)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
+	}
+	// Accept either a positional index or a (stable) target id, so callers can
+	// switch by the id printed by `pages`/`newpage` and not worry about ordering.
+	idx, err := strconv.Atoi(args[0])
+	if err != nil {
+		idx, err = matchTargetID(targetIDs(pages), args[0])
+		if err != nil {
+			fatal("%v", err)
+		}
 	}
 	if idx < 0 || idx >= len(pages) {
 		fatal("page index %d out of range (0-%d)", idx, len(pages)-1)
 	}
-	s.ActivePage = idx
+	setActivePage(s, pages, idx)
 	if err := saveState(s); err != nil {
 		fatal("failed to save state: %v", err)
 	}
@@ -1590,20 +1843,25 @@ func cmdNewPage(args []string) {
 		}
 	}
 
-	// Switch active to the new page
-	pages, _ := browser.Pages()
+	// Switch active to the new page, keyed by its stable target id.
+	pages, _ := orderedPages(browser)
 	for i, p := range pages {
 		if p.TargetID == page.TargetID {
-			s.ActivePage = i
+			setActivePage(s, pages, i)
 			break
 		}
 	}
 	_ = saveState(s)
 
 	info, _ := page.Info()
+	url = ""
 	if info != nil {
-		fmt.Printf("Opened [%d] %s\n", s.ActivePage, info.URL)
+		url = info.URL
 	}
+	fmt.Printf("Opened [%d] %s\n", s.ActivePage, url)
+	// Print the target id on its own line so an agent can capture it and pin
+	// later commands with --target / RODNEY_TARGET.
+	fmt.Printf("target: %s\n", page.TargetID)
 }
 
 func cmdClosePage(args []string) {
@@ -1615,33 +1873,47 @@ func cmdClosePage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	pages, err := orderedPages(browser)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
 	}
 	if len(pages) <= 1 {
 		fatal("cannot close the last page")
 	}
 
-	idx := s.ActivePage
+	// Default to the resolved active tab; otherwise an index or a target id.
+	idx := -1
 	if len(args) > 0 {
 		idx, err = strconv.Atoi(args[0])
 		if err != nil {
-			fatal("invalid index: %v", err)
+			idx, err = matchTargetID(targetIDs(pages), args[0])
+			if err != nil {
+				fatal("%v", err)
+			}
 		}
+	} else if active, aerr := getActivePage(browser, s); aerr == nil {
+		idx = slices.IndexFunc(pages, func(p *rod.Page) bool { return p.TargetID == active.TargetID })
 	}
 	if idx < 0 || idx >= len(pages) {
-		fatal("page index %d out of range", idx)
+		fatal("page index %d out of range (0-%d)", idx, len(pages)-1)
 	}
 
+	closedID := string(pages[idx].TargetID)
 	pages[idx].MustClose()
 
-	// Adjust active page
-	if s.ActivePage >= len(pages)-1 {
-		s.ActivePage = len(pages) - 2
-	}
-	if s.ActivePage < 0 {
-		s.ActivePage = 0
+	// Re-resolve the active tab. If we closed it (or nothing was tracked),
+	// default to the first remaining tab; otherwise keep pointing at the same id.
+	remaining, _ := orderedPages(browser)
+	if len(remaining) > 0 {
+		if s.ActiveTarget == "" || s.ActiveTarget == closedID {
+			setActivePage(s, remaining, 0)
+		} else if i := slices.IndexFunc(remaining, func(p *rod.Page) bool {
+			return string(p.TargetID) == s.ActiveTarget
+		}); i >= 0 {
+			setActivePage(s, remaining, i)
+		} else {
+			setActivePage(s, remaining, 0)
+		}
 	}
 	_ = saveState(s)
 	fmt.Printf("Closed page %d\n", idx)

@@ -6,6 +6,7 @@ Browser lifecycle:
                                     --insecure, -k   ignore TLS errors
                                     --user-agent UA  override the User-Agent
                                     --stealth        hide common headless automation tells
+                                    --replace        restart even if a session is already running
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
@@ -55,11 +56,11 @@ Screenshots:
   rodney screenshot [-w N] [-h N] [file]  Take page screenshot
   rodney screenshot-el <sel> [f]  Screenshot an element
 
-Tabs:
-  rodney pages                    List all pages/tabs
-  rodney page <index>             Switch to page by index
-  rodney newpage [url]            Open a new page/tab
-  rodney closepage [index]        Close a page/tab
+Tabs (indices are stable across calls; target ids are stable for the tab's life):
+  rodney pages                    List all pages/tabs (shows target id per tab)
+  rodney page <index|target-id>   Switch active tab by index or target id
+  rodney newpage [url]            Open a new tab; prints its target id ("target: ID")
+  rodney closepage [index|target-id]  Close a tab (defaults to the active one)
 
 Element checks:
   rodney exists <selector>        Check if element exists (exit 1 if not)
@@ -72,9 +73,11 @@ Accessibility:
   rodney ax-find [--name N] [--role R] [--json]  Find accessible nodes
   rodney ax-node <selector> [--json]        Show accessibility info for element
 
-Options:
+Options (may appear anywhere in the command):
   --local                         Use directory-scoped session (./.rodney/)
   --global                        Use global session (~/.rodney/)
+  --session NAME                  Isolate state under sessions/NAME (own Chrome)
+  --target ID                     Operate on the tab with this target id
   --version                       Print version and exit
   --help, -h, help                Show this help message
 
@@ -82,8 +85,18 @@ By default, commands auto-detect: if ./.rodney/state.json exists in the
 current directory, the local session is used; otherwise the global session.
 Use "rodney start --local" to create a directory-scoped session.
 
+Running multiple agents in parallel (no conflicts):
+  Isolation (simplest) — give each agent its own Chrome:
+    RODNEY_SESSION=agent1 rodney start      # or --session agent1
+    RODNEY_SESSION=agent1 rodney open ...    # each agent: set it once, use normally
+  Shared browser — one Chrome, each agent pins its own tab:
+    id=$(rodney newpage https://site | sed -n 's/^target: //p')
+    RODNEY_TARGET=$id rodney open https://site   # or --target $id on each command
+
 Environment:
   RODNEY_HOME                     Override data directory (default: ~/.rodney)
+  RODNEY_SESSION                  Isolate state under sessions/NAME (own Chrome)
+  RODNEY_TARGET                   Operate on the tab with this target id
   ROD_TIMEOUT                     Default timeout in seconds (default: 30)
   RODNEY_DEBUG                    Show full Go stack traces instead of clean errors
 
