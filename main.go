@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/devices"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
@@ -196,6 +197,8 @@ type State struct {
 	ProxyPort        int    `json:"proxy_port,omitempty"`         // local port of auth proxy
 	ConsoleLoggerPID int    `json:"console_logger_pid,omitempty"` // PID of console-capture sidecar
 	NoCacheDisabled  bool   `json:"no_cache_disabled,omitempty"`  // re-apply Network.setCacheDisabled on every command
+	Visible          bool   `json:"visible,omitempty"`            // --show or connect: skip go-rod's device emulation
+	UserAgent        string `json:"user_agent,omitempty"`         // UA for the headless device emulation
 
 	Extensions []extensionInfo `json:"extensions,omitempty"` // extensions passed to --load-extension
 }
@@ -278,10 +281,24 @@ func removeState() {
 }
 
 // connectBrowser connects to the running Chrome instance.
-// NoDefaultDevice prevents go-rod from emulating a 1280x800 desktop viewport
-// on every page — we want pages to render at the real window size.
+//
+// go-rod emulates a 1280x800 desktop device (viewport, touch and a hardcoded
+// Chrome/114 User-Agent) on every page it touches. A visible window should
+// render at its real size, so --show and connect sessions skip that. Headless
+// sessions keep the 1280x800 viewport, because without it pages lay out at the
+// headless window size and send a "HeadlessChrome" User-Agent, but the UA is
+// replaced by the one pinned at start (see headlessFreeUserAgent). State files
+// from before that field existed get go-rod's stock device, as upstream did.
 func connectBrowser(s *State) (*rod.Browser, error) {
-	browser := rod.New().ControlURL(s.DebugURL).NoDefaultDevice()
+	browser := rod.New().ControlURL(s.DebugURL)
+	switch {
+	case s.Visible:
+		browser = browser.NoDefaultDevice()
+	case s.UserAgent != "":
+		device := devices.LaptopWithMDPIScreen
+		device.UserAgent = s.UserAgent
+		browser = browser.DefaultDevice(device.Landscape())
+	}
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("failed to connect to browser (is it still running?): %w", err)
 	}
@@ -792,8 +809,12 @@ func formatEvalValue(v gson.JSON) string {
 // form. When asJSON is true the value is JSON.stringify'd and pretty-printed so
 // the output is always valid JSON (ideal for piping to jq/jaq).
 func evalJSExpr(page *rod.Page, expr string, asJSON bool) (string, error) {
+	// Scripts from --file or stdin usually end in a newline, often a ';' and
+	// sometimes a line comment; keep all of those from breaking the wrapper.
+	expr = strings.TrimRight(strings.TrimSpace(expr), ";")
 	if asJSON {
-		result, err := page.Eval(fmt.Sprintf(`() => JSON.stringify((%s) ?? null)`, expr))
+		// Await first so a returned Promise is serialised by value, not as {}.
+		result, err := page.Eval(fmt.Sprintf("async () => JSON.stringify((await (\n%s\n)) ?? null)", expr))
 		if err != nil {
 			return "", err
 		}
@@ -807,7 +828,7 @@ func evalJSExpr(page *rod.Page, expr string, asJSON bool) (string, error) {
 		}
 		return string(out), nil
 	}
-	result, err := page.Eval(fmt.Sprintf(`() => { return (%s); }`, expr))
+	result, err := page.Eval(fmt.Sprintf("() => { return (\n%s\n); }", expr))
 	if err != nil {
 		return "", err
 	}
@@ -830,6 +851,22 @@ const stealthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 func applyStealthFlags(l *launcher.Launcher) {
 	l.Set("disable-blink-features", "AutomationControlled")
 	l.Delete("enable-automation")
+}
+
+// headlessFreeUserAgent returns the launched browser's own User-Agent with
+// "HeadlessChrome" swapped for "Chrome", so the version matches the real
+// binary (go-rod's stock device claims Chrome/114, which modern apps reject).
+// Returns "" if the browser can't be asked, which keeps go-rod's default.
+func headlessFreeUserAgent(debugURL string) string {
+	browser := rod.New().ControlURL(debugURL).NoDefaultDevice()
+	if err := browser.Connect(); err != nil {
+		return ""
+	}
+	v, err := proto.BrowserGetVersion{}.Call(browser)
+	if err != nil {
+		return ""
+	}
+	return strings.Replace(v.UserAgent, "HeadlessChrome/", "Chrome/", 1)
 }
 
 // bringToFront makes page the browser's foreground target.
@@ -1021,6 +1058,14 @@ func cmdStart(args []string) {
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
+	// Headless commands emulate a 1280x800 device, which overrides the UA per
+	// page (see connectBrowser). Pin it to the UA asked for, or else to the
+	// browser's own UA without the "HeadlessChrome" tell.
+	sessionUA := ua
+	if headless && sessionUA == "" {
+		sessionUA = headlessFreeUserAgent(debugURL)
+	}
+
 	// Launch console-capture sidecar so 'rodney console' can replay output.
 	// Best-effort: if it fails to start, Chrome itself is still usable.
 	var consoleLoggerPID int
@@ -1043,6 +1088,8 @@ func cmdStart(args []string) {
 		ProxyPort:        proxyPort,
 		Extensions:       extensions,
 		ConsoleLoggerPID: consoleLoggerPID,
+		Visible:          !headless,
+		UserAgent:        sessionUA,
 		// HTTP cache off by default. Toggle with `rodney no-cache off` if you
 		// need cache-on for a session (rare — usually only when testing cache
 		// behavior itself). The per-command re-apply (line ~427) plus the
@@ -1128,11 +1175,14 @@ func cmdConnect(args []string) {
 		fatal("could not connect to browser: %v", err)
 	}
 
-	// ChromePID=0 signals that we don't own this browser (stop won't kill it)
+	// ChromePID=0 signals that we don't own this browser (stop won't kill it).
+	// An attached browser is normally someone's real window, so leave its
+	// viewport and UA alone.
 	state := &State{
 		DebugURL:   info.WebSocketDebuggerURL,
 		ChromePID:  0,
 		ActivePage: 0,
+		Visible:    true,
 	}
 	if err := saveState(state); err != nil {
 		fatal("failed to save state: %v", err)
@@ -2898,11 +2948,19 @@ func cmdInternalConsoleLogger(args []string) {
 	debugURL := args[0]
 	logPath := args[1]
 
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// The sidecar is spawned without --local/--global/--session (and may
+	// inherit RODNEY_SESSION), so pin its state lookups to the session that
+	// launched it: the log sits in that session's state dir.
+	activeStateDir = filepath.Dir(logPath)
+	activeSession = ""
+
+	// Pages log tokens and personal data often enough; keep the log private.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		os.Exit(2)
 	}
 	defer f.Close()
+	_ = f.Chmod(0o600)
 
 	// NoDefaultDevice: don't apply 1280x800 desktop emulation to live pages.
 	// The console-logger only reads runtime events, but the rod browser
@@ -3012,7 +3070,7 @@ func cmdConsole(args []string) {
 	path := consoleLogPath()
 
 	if *clear {
-		if err := os.WriteFile(path, []byte{}, 0644); err != nil {
+		if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
 			fatal("failed to clear console log: %v", err)
 		}
 		fmt.Println("Console log cleared")
