@@ -164,7 +164,7 @@ assert_eq "$OUT" "Element visible" "wait for element works"
 echo "[Screenshots]"
 
 OUT=$($CLI screenshot /tmp/rod-test-ss.png 2>&1)
-assert_contains "$OUT" "Saved" "screenshot saves file"
+assert_eq "$OUT" "/tmp/rod-test-ss.png" "screenshot prints the saved path"
 test -f /tmp/rod-test-ss.png && pass "screenshot file exists" || fail "screenshot file exists" "missing"
 
 # --- Tabs ---
