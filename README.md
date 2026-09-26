@@ -1,24 +1,6 @@
 # Rodney: Chrome automation from the command line
 
-> **This is [rodrigolive](https://github.com/rodrigolive)'s fork of [simonw/rodney](https://github.com/simonw/rodney).**
-> Upstream has been quiet since 2026-03-12, with its open PRs unmerged. This fork collects the fork work that matters for agents driving rodney on macOS. Every branch was read line by line before merging and pinned to the SHA that was reviewed.
->
-> | Merged | Pinned | What it brings |
-> |---|---|---|
-> | [goeric PR #54](https://github.com/simonw/rodney/pull/54) | `663fc04` | Fixes two Chromium browser-process crashes: no `--single-process` on macOS, and no field-trial experiments such as HistoryEmbeddings |
-> | [goeric PR #55](https://github.com/simonw/rodney/pull/55) | `62b5bbf` | Raises the target tab before screenshots, so `page N` + `screenshot` no longer times out |
-> | [goeric PR #52](https://github.com/simonw/rodney/pull/52) | `920b808` | `start --extension PATH` (dir/.crx/.zip) and `rodney extensions` |
-> | [ejolly/main](https://github.com/ejolly/rodney) | `e715d1a` | `--session`/`--target` for parallel agents, stable tab ids, atomic state, non-destructive `start`, `open --wait/--timeout/--expect-ok/--then-js`, `js --json`, `--user-agent`/`--stealth`, clean errors instead of stack traces |
-> | [chrisperfer/main](https://github.com/chrisperfer/rodney) | `8b0154c` | `rodney console`, `js -` / `js --file`, `--page <idx\|substring>`, HTTP cache off by default (`no-cache on\|off`), `--show` maximized |
->
-> Fork-only fixes on top:
-> - Headless sessions keep a 1280x800 viewport, with the browser's real UA minus `HeadlessChrome`. Visible sessions render at the real window size.
-> - `--page` beats `--target`.
-> - The console sidecar stays in its own session, and `console.log` is 0600.
-> - `js --json` awaits promises.
-> - The `just`/golangci tooling was replaced by a `Makefile`; run `make` for usage.
->
-> Considered but not merged: zbkilla's `rodney network` (anonymous commit identity, plus unsafe PID handling and file writes driven by CDP data) and the large bundle forks (jamalex, Battle-Creek-LLC, devskale).
+> **This is [rodrigolive](https://github.com/rodrigolive)'s fork of [simonw/rodney](https://github.com/simonw/rodney).** It merges reviewed fixes and features from other forks that upstream hasn't taken yet. See [About this fork](#about-this-fork) for what changed, where it came from and how it was checked. `pip install rodney` / `uvx rodney` still install upstream; build from source to get this version.
 
 [![PyPI](https://img.shields.io/pypi/v/rodney.svg)](https://pypi.org/project/rodney/)
 [![Changelog](https://img.shields.io/github/v/release/simonw/rodney?include_prereleases&label=changelog)](https://github.com/simonw/rodney/releases)
@@ -26,6 +8,80 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/simonw/rodney/blob/main/LICENSE)
 
 A Go CLI tool that drives a persistent headless Chrome instance using the [rod](https://github.com/go-rod/rod) browser automation library. Each command connects to the same long-running Chrome process, making it easy to script multi-step browser interactions from shell scripts or interactive use.
+
+## About this fork
+
+### Why it exists
+
+Upstream's last commit was on 2026-03-12. Since then, open PRs and bug reports (crashes on macOS, a `--show` fix that never got a release) have sat unmerged, and useful work has spread across dozens of forks. This fork pulls the best of that work into one tree. It is aimed at the way I use rodney: coding agents driving a headless Chrome on macOS, often several agents at once.
+
+### How the forks were chosen and checked
+
+1. I listed all 58 forks of simonw/rodney and compared each branch with upstream `main`. 46 branches had commits of their own. I read their logs and dropped duplicates, stale copies, personal tweaks and anything already fixed upstream.
+2. Before merging, I read every added line of the shortlisted branches, looking specifically for:
+   - network calls to anything other than the local Chrome DevTools endpoint;
+   - code that downloads or runs other programs, obfuscated strings, and file writes or deletes outside rodney's own state directory;
+   - new Go dependencies, which I checked against the Go module proxy and checksum database;
+   - CI workflows that use secrets or publish anything, and README or help text written to steer AI agents.
+
+   I also checked who wrote each commit: real, long-standing GitHub accounts versus anonymous identities.
+3. Every branch is merged **by the exact commit SHA that was reviewed**, never by branch name, so anything pushed to those forks later cannot slip in. Each merge commit message says what the branch does, how conflicts were resolved and what the review found.
+
+No malicious code turned up. Two branches had real safety problems; one was fixed after merging and the other was left out (see below).
+
+### What was merged
+
+| Source | Reviewed SHA | What it adds |
+|---|---|---|
+| [goeric, PR #54](https://github.com/simonw/rodney/pull/54) | `663fc04` | Fixes two crashes that take down the whole browser: `--single-process` is no longer used on macOS (any page touching the camera/mic API aborted Chromium), and unfinished Chromium experiments such as HistoryEmbeddings are switched off |
+| [goeric, PR #55](https://github.com/simonw/rodney/pull/55) | `62b5bbf` | `rodney page N` now brings the tab to the front, so a following `screenshot` no longer times out (or hangs for minutes with `screenshot-el`) |
+| [goeric, PR #52](https://github.com/simonw/rodney/pull/52) | `920b808` | `rodney start --extension PATH` loads unpacked, `.crx` or `.zip` extensions in headless mode; `rodney extensions` lists their IDs |
+| [ejolly/rodney](https://github.com/ejolly/rodney) | `e715d1a` | Safe parallel use: `--session NAME` gives each agent its own Chrome, `--target ID` pins a command to a tab, tabs are tracked by stable ID, state writes are atomic, and `start` reuses a live browser instead of killing it (`--replace` to restart). Also `open --wait/--timeout/--expect-ok/--then-js`, `js --json`, `start --user-agent/--stealth`, `rodney version`, and one-line errors instead of Go stack traces |
+| [chrisperfer/rodney](https://github.com/chrisperfer/rodney) | `8b0154c` | `rodney console` to read the page's console output and uncaught errors, `js -` (stdin) and `js --file PATH`, `--page <index or URL/title text>` to target one command at a tab, HTTP cache off by default (`rodney no-cache on\|off`), and `--show` opening maximized |
+
+### Changes made in this fork
+
+- **Headless viewport and User-Agent.** chrisperfer's branch turned off go-rod's built-in 1280x800 device for every session. In a visible window that's right, but in headless mode it meant pages were laid out at a different size, which shifts responsive layouts, and sent a `HeadlessChrome` User-Agent that bot checks look for. Now visible sessions render at the real window size, while headless sessions keep 1280x800 with the browser's real User-Agent minus the "Headless" part (go-rod's default claimed Chrome 114, which some modern sites reject). `start --user-agent` and `--stealth` now actually apply in headless mode too.
+- **`--page` was being ignored.** After merging, the saved tab was always checked first. The order is now `--page`, then `--target`, then the saved tab.
+- **Console log privacy.** `console.log` captures output from every tab, which can include tokens. It's now readable only by its owner, and the capture process stays attached to the session that started it.
+- **`js --json` waits for promises** instead of printing `{}`. Scripts passed with `--file` or stdin can end with `;` or a `//` comment.
+- **Tooling.** ejolly's `just`/golangci-lint setup (about 240 extra lines in `go.mod`) is replaced by a `Makefile`. Run `make` for the list of targets. Contributor notes are in [AGENTS.md](AGENTS.md).
+
+### What was left out, and why
+
+- **zbkilla's `rodney network`** (request and response capture). It's a feature I want, but the commits come from an anonymous identity (`Demo User <demo@example.com>`) and the code had real safety problems:
+  - a malformed pid file could make `network record stop` kill every process you own;
+  - request IDs coming from the browser were used as file paths without checks;
+  - captured auth headers were saved world-readable;
+  - the capture process never exits.
+
+  Better to write this cleanly than patch it.
+- **Large bundle forks** (jamalex, Battle-Creek-LLC, devskale and others). They are big rewrites or roll-ups of the same open PRs, would break existing commands, and have gone quiet.
+
+### Behaviour changes from upstream
+
+- The HTTP cache is off by default. Use `rodney no-cache off` for a session that needs it.
+- `rodney start` reuses a browser that's already running. Use `--replace` to restart it.
+- On macOS, Chrome no longer runs with `--single-process`.
+
+### Install
+
+```bash
+git clone https://github.com/rodrigolive/rodney
+cd rodney
+make build        # ./rodney, version-stamped from git
+make install      # copies it to INSTALL_DIR (default ~/util)
+```
+
+Requires Go 1.25+. Chrome/Chromium is downloaded automatically on first `start`, or set `ROD_CHROME_BIN`.
+
+### Status
+
+The merged tree builds, passes `go vet` and gofmt, and its tests compile. The full browser-backed test suite (`make test`) has not been run against the merged result yet.
+
+### Keeping up with upstream
+
+`make upstream` fetches simonw/rodney and lists any commits that aren't merged here yet. If upstream starts merging again, this fork will follow it, and anything here that lands upstream will be dropped.
 
 ## Architecture
 
