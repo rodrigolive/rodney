@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"cmp"
 	_ "embed"
 	"encoding/base64"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -86,6 +88,11 @@ func sanitizeSession(name string) string {
 	return name
 }
 
+// pageOverride, when non-empty, targets a specific tab for this one command
+// instead of the saved active page. It is a numeric index or a case-insensitive
+// URL/title substring. It is transient: never written back to state.json.
+var pageOverride string
+
 // extractScopeArgs scans args for --local/--global, removes them, and returns the mode.
 // If both appear, the last one wins.
 func extractScopeArgs(args []string) (scopeMode, []string) {
@@ -102,6 +109,62 @@ func extractScopeArgs(args []string) (scopeMode, []string) {
 		}
 	}
 	return mode, filtered
+}
+
+// extractPageArg scans args for `--page <val>` or `--page=<val>`, removes them,
+// and returns the value (empty if absent). The last occurrence wins.
+func extractPageArg(args []string) (string, []string) {
+	override := ""
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--page":
+			if i+1 < len(args) {
+				override = args[i+1]
+				i++ // consume the value token
+			}
+		case strings.HasPrefix(arg, "--page="):
+			override = strings.TrimPrefix(arg, "--page=")
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+	return override, filtered
+}
+
+// pageRef is the minimal tab info resolvePageIndex needs (kept browser-free for testing).
+type pageRef struct {
+	URL   string
+	Title string
+}
+
+// resolvePageIndex maps a --page override to an index into refs. The override is
+// either a numeric index or a case-insensitive substring matched against URL/title.
+// A substring that matches zero or multiple tabs is an error.
+func resolvePageIndex(refs []pageRef, override string) (int, error) {
+	if idx, err := strconv.Atoi(override); err == nil {
+		if idx < 0 || idx >= len(refs) {
+			return 0, fmt.Errorf("--page index %d out of range (0-%d)", idx, len(refs)-1)
+		}
+		return idx, nil
+	}
+	needle := strings.ToLower(override)
+	var matches []int
+	for i, r := range refs {
+		if strings.Contains(strings.ToLower(r.URL), needle) ||
+			strings.Contains(strings.ToLower(r.Title), needle) {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return 0, fmt.Errorf("--page %q matched no open tab", override)
+	case 1:
+		return matches[0], nil
+	default:
+		return 0, fmt.Errorf("--page %q matched %d tabs; be more specific", override, len(matches))
+	}
 }
 
 // resolveStateDir determines the state directory based on scope mode and working directory.
@@ -124,13 +187,15 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL     string `json:"debug_url"`
-	ChromePID    int    `json:"chrome_pid"`
-	ActivePage   int    `json:"active_page"`             // legacy: index into the (stably sorted) pages list
-	ActiveTarget string `json:"active_target,omitempty"` // stable target id of the active tab
-	DataDir      string `json:"data_dir"`
-	ProxyPID     int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort    int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL         string `json:"debug_url"`
+	ChromePID        int    `json:"chrome_pid"`
+	ActivePage       int    `json:"active_page"`             // legacy: index into the (stably sorted) pages list
+	ActiveTarget     string `json:"active_target,omitempty"` // stable target id of the active tab
+	DataDir          string `json:"data_dir"`
+	ProxyPID         int    `json:"proxy_pid,omitempty"`          // PID of auth proxy helper
+	ProxyPort        int    `json:"proxy_port,omitempty"`         // local port of auth proxy
+	ConsoleLoggerPID int    `json:"console_logger_pid,omitempty"` // PID of console-capture sidecar
+	NoCacheDisabled  bool   `json:"no_cache_disabled,omitempty"`  // re-apply Network.setCacheDisabled on every command
 
 	Extensions []extensionInfo `json:"extensions,omitempty"` // extensions passed to --load-extension
 }
@@ -153,6 +218,10 @@ func stateDir() string {
 		return filepath.Join(base, "sessions", sanitizeSession(activeSession))
 	}
 	return base
+}
+
+func consoleLogPath() string {
+	return filepath.Join(stateDir(), "console.log")
 }
 
 func statePath() string {
@@ -208,9 +277,11 @@ func removeState() {
 	_ = os.Remove(statePath())
 }
 
-// connectBrowser connects to the running Chrome instance
+// connectBrowser connects to the running Chrome instance.
+// NoDefaultDevice prevents go-rod from emulating a 1280x800 desktop viewport
+// on every page — we want pages to render at the real window size.
 func connectBrowser(s *State) (*rod.Browser, error) {
-	browser := rod.New().ControlURL(s.DebugURL)
+	browser := rod.New().ControlURL(s.DebugURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("failed to connect to browser (is it still running?): %w", err)
 	}
@@ -296,6 +367,22 @@ func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
 	if len(pages) == 0 {
 		return nil, fmt.Errorf("no pages open")
 	}
+	// Per-command overrides beat the saved active tab: --page (index into the
+	// same stably ordered list 'pages' prints, or a URL/title substring) first,
+	// then --target / RODNEY_TARGET (stable target id).
+	if pageOverride != "" {
+		refs := make([]pageRef, len(pages))
+		for i, p := range pages {
+			if info, _ := p.Info(); info != nil {
+				refs[i] = pageRef{URL: info.URL, Title: info.Title}
+			}
+		}
+		idx, err := resolvePageIndex(refs, pageOverride)
+		if err != nil {
+			return nil, err
+		}
+		return pages[idx], nil
+	}
 	if activeTarget != "" {
 		return pageByTarget(pages, activeTarget)
 	}
@@ -355,12 +442,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Extract the global flags (--local/--global, --session, --target) from all
-	// args before dispatching, so they can appear anywhere in the command.
+	// Extract the global flags (--local/--global, --session, --target, --page)
+	// from all args before dispatching, so they can appear anywhere in the command.
 	mode, cleanedArgs := extractScopeArgs(os.Args[1:])
 	var sessionVal, targetVal string
 	sessionVal, cleanedArgs = extractValueFlag(cleanedArgs, "--session")
 	targetVal, cleanedArgs = extractValueFlag(cleanedArgs, "--target")
+	pageOverride, cleanedArgs = extractPageArg(cleanedArgs)
 	activeSession = cmp.Or(sessionVal, os.Getenv("RODNEY_SESSION"))
 	activeTarget = cmp.Or(targetVal, os.Getenv("RODNEY_TARGET"))
 
@@ -383,6 +471,8 @@ func main() {
 	switch cmd {
 	case "_proxy":
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
+	case "_console_logger":
+		cmdInternalConsoleLogger(args) // hidden: runs the console-capture sidecar
 	case "start":
 		cmdStart(args)
 	case "connect":
@@ -405,6 +495,8 @@ func main() {
 		cmdReload(args)
 	case "clear-cache":
 		cmdClearCache(args)
+	case "no-cache":
+		cmdNoCache(args)
 	case "url":
 		cmdURL(args)
 	case "title":
@@ -473,6 +565,8 @@ func main() {
 		cmdAXFind(args)
 	case "ax-node":
 		cmdAXNode(args)
+	case "console":
+		cmdConsole(args)
 	case "help", "-h", "--help":
 		printUsage()
 		os.Exit(0)
@@ -570,6 +664,13 @@ func withPageTimeout(timeout time.Duration) (*State, *rod.Browser, *rod.Page) {
 	page, err := getActivePage(browser, s)
 	if err != nil {
 		fatal("%v", err)
+	}
+	// Re-apply cache-disabled each command so it persists across rodney's
+	// connect-per-command model (CDP state is per-session, so a one-shot set
+	// wouldn't survive). Best-effort: a failure here shouldn't block the command.
+	if s.NoCacheDisabled {
+		_ = (proto.NetworkEnable{}).Call(page)
+		_ = (proto.NetworkSetCacheDisabled{CacheDisabled: true}).Call(page)
 	}
 	return s, browser, page.Timeout(timeout)
 }
@@ -833,6 +934,14 @@ func cmdStart(args []string) {
 	l := launcher.New().
 		Set("no-sandbox").
 		Set("disable-gpu").
+		// Effectively disable the disk and media caches at the Chrome process
+		// level. Browser-UI reloads, DevTools reloads, and scripted reloads all
+		// honor this — unlike CDP's Network.setCacheDisabled, which is target-
+		// scoped and can desync from the visible DevTools checkbox state. This
+		// matches the developer expectation that rodney sessions never serve
+		// stale assets.
+		Set("disk-cache-size", "1").
+		Set("media-cache-size", "1").
 		Leakless(false). // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
@@ -843,10 +952,12 @@ func cmdStart(args []string) {
 
 	l = configureExperiments(l)
 
-	// When in non-headless mode, make sure that we show the startup window immediately
-	// (instead of showing a window only after calling "rodney open")
+	// When in non-headless mode, show the startup window immediately and
+	// open it maximized so users don't get a small fixed-size window.
 	if !headless {
 		l = l.Delete("no-startup-window")
+		l = l.Set("start-maximized")
+		l = l.Set("profile-directory", "Default")
 	}
 
 	l = configureExtensions(l, headless, extensions)
@@ -910,14 +1021,34 @@ func cmdStart(args []string) {
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
+	// Launch console-capture sidecar so 'rodney console' can replay output.
+	// Best-effort: if it fails to start, Chrome itself is still usable.
+	var consoleLoggerPID int
+	{
+		exe, _ := os.Executable()
+		ccmd := exec.Command(exe, "_console_logger", debugURL, consoleLogPath())
+		setSysProcAttr(ccmd)
+		if err := ccmd.Start(); err == nil {
+			consoleLoggerPID = ccmd.Process.Pid
+			ccmd.Process.Release()
+		}
+	}
+
 	state := &State{
-		DebugURL:   debugURL,
-		ChromePID:  pid,
-		ActivePage: 0,
-		DataDir:    dataDir,
-		ProxyPID:   proxyPID,
-		ProxyPort:  proxyPort,
-		Extensions: extensions,
+		DebugURL:         debugURL,
+		ChromePID:        pid,
+		ActivePage:       0,
+		DataDir:          dataDir,
+		ProxyPID:         proxyPID,
+		ProxyPort:        proxyPort,
+		Extensions:       extensions,
+		ConsoleLoggerPID: consoleLoggerPID,
+		// HTTP cache off by default. Toggle with `rodney no-cache off` if you
+		// need cache-on for a session (rare — usually only when testing cache
+		// behavior itself). The per-command re-apply (line ~427) plus the
+		// console-logger's periodic per-page enforcement together make this
+		// hold across browser-UI reloads, not just rodney-driven navigation.
+		NoCacheDisabled: true,
 	}
 
 	if err := saveState(state); err != nil {
@@ -992,7 +1123,7 @@ func cmdConnect(args []string) {
 	}
 
 	// Verify the connection works
-	browser := rod.New().ControlURL(info.WebSocketDebuggerURL)
+	browser := rod.New().ControlURL(info.WebSocketDebuggerURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		fatal("could not connect to browser: %v", err)
 	}
@@ -1034,6 +1165,14 @@ func cmdStop(args []string) {
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
 			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
+	if s.ConsoleLoggerPID > 0 {
+		if proc, err := os.FindProcess(s.ConsoleLoggerPID); err == nil {
+			// Use Kill rather than SIGTERM so this works cross-platform
+			// (SIGTERM is not delivered to processes on Windows). The
+			// sidecar has no graceful-shutdown logic worth waiting for.
+			_ = proc.Kill()
 		}
 	}
 	removeState()
@@ -1252,6 +1391,39 @@ func cmdClearCache(args []string) {
 	fmt.Println("Browser cache cleared")
 }
 
+// cmdNoCache toggles HTTP-cache-disabled for the session. The flag is stored in
+// state and re-applied by withPage on every subsequent command, so it persists
+// across reloads despite rodney connecting fresh each invocation.
+func cmdNoCache(args []string) {
+	on := true
+	if len(args) > 0 {
+		switch strings.ToLower(args[0]) {
+		case "on", "true", "1", "yes":
+			on = true
+		case "off", "false", "0", "no":
+			on = false
+		default:
+			fatal("usage: rodney no-cache <on|off>")
+		}
+	}
+	s, _, page := withPage()
+	if err := (proto.NetworkEnable{}).Call(page); err != nil {
+		fatal("failed to enable network domain: %v", err)
+	}
+	if err := (proto.NetworkSetCacheDisabled{CacheDisabled: on}).Call(page); err != nil {
+		fatal("set cache-disabled failed: %v", err)
+	}
+	s.NoCacheDisabled = on
+	if err := saveState(s); err != nil {
+		fatal("failed to save state: %v", err)
+	}
+	if on {
+		fmt.Println("HTTP cache disabled (re-applied on every command until 'no-cache off')")
+	} else {
+		fmt.Println("HTTP cache re-enabled")
+	}
+}
+
 func cmdURL(args []string) {
 	_, _, page := withPage()
 	info, err := page.Info()
@@ -1352,23 +1524,49 @@ func cmdPDF(args []string) {
 
 func cmdJS(args []string) {
 	// Flags must precede the expression (a JS expression can start with '-');
-	// use '--' to pass such an expression literally.
+	// use '--' to pass such an expression literally. '-' reads the expression
+	// from stdin and --file reads it from a path.
+	const jsUsage = "usage: rodney js [--timeout SEC] [--json] <expression> | - | --file <path>"
 	fs := flag.NewFlagSet("js", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	timeoutSecs := fs.Float64("timeout", 0, "")
 	jsonOut := fs.Bool("json", false, "")
+	file := fs.String("file", "", "")
 	if err := fs.Parse(args); err != nil {
-		fatal("unknown flag: %s\nusage: rodney js [--timeout SEC] [--json] <expression>", findUnknownFlag(args, fs))
+		fatal("unknown flag: %s\n%s", findUnknownFlag(args, fs), jsUsage)
 	}
 	rest := fs.Args()
-	if len(rest) < 1 {
-		fatal("usage: rodney js [--timeout SEC] [--json] <expression>")
+
+	var expr string
+	switch {
+	case *file != "":
+		data, err := os.ReadFile(*file)
+		if err != nil {
+			fatal("failed to read --file %s: %v", *file, err)
+		}
+		expr = string(data)
+	case len(rest) == 1 && rest[0] == "-":
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr = string(data)
+	case len(rest) >= 1:
+		expr = strings.Join(rest, " ")
+	default:
+		fatal("%s", jsUsage)
 	}
-	expr := strings.Join(rest, " ")
+	if strings.TrimSpace(expr) == "" {
+		fatal("empty JS expression")
+	}
+
 	_, _, page := withPageTimeout(resolveTimeout(*timeoutSecs))
 
 	out, err := evalJSExpr(page, expr, *jsonOut)
 	if err != nil {
+		if *timeoutSecs > 0 && strings.Contains(err.Error(), "context deadline exceeded") {
+			fatal("JS timeout after %gs (use a larger --timeout to extend)", *timeoutSecs)
+		}
 		fatal("JS error: %v", err)
 	}
 	fmt.Println(out)
@@ -1785,12 +1983,21 @@ func cmdScreenshot(args []string) {
 	if err != nil {
 		fatal("failed to set viewport: %v", err)
 	}
+	// Always clear the override before exit, regardless of whether Screenshot
+	// succeeded or fataled. Without this the viewport stays pinned at the
+	// screenshot dimensions for every subsequent interaction in this tab.
+	// Note: defer alone is insufficient because fatal() calls os.Exit, which
+	// skips deferred calls.
+	clearOverride := func() { proto.EmulationClearDeviceMetricsOverride{}.Call(page) }
+	defer clearOverride()
 
 	data, err := page.Screenshot(fullPage, nil)
 	if err != nil {
+		clearOverride()
 		fatal("screenshot failed: %v", err)
 	}
 	if err := os.WriteFile(file, data, 0644); err != nil {
+		clearOverride()
 		fatal("failed to write screenshot: %v", err)
 	}
 	fmt.Println(file)
@@ -2630,4 +2837,241 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, upstream, authHeader stri
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// consoleLogEntry is one JSON-Lines record written by the console sidecar.
+type consoleLogEntry struct {
+	TS    string `json:"ts"`            // RFC3339Nano UTC
+	Src   string `json:"src"`           // "console" | "exception"
+	Level string `json:"level"`         // log/info/warn/error/debug
+	Text  string `json:"text"`          // rendered message
+	Loc   string `json:"loc,omitempty"` // url:line if available
+}
+
+// renderConsoleArg turns one RuntimeRemoteObject into a printable string.
+// Primitives use their JSON value; non-primitives use Description (the
+// canonical browser-side preview).
+func renderConsoleArg(a *proto.RuntimeRemoteObject) string {
+	if a == nil {
+		return ""
+	}
+	switch a.Type {
+	case "string":
+		return a.Value.Str()
+	case "number", "boolean":
+		return a.Value.JSON("", "")
+	case "undefined":
+		return "undefined"
+	case "object":
+		if a.Subtype == "null" {
+			return "null"
+		}
+		if a.Description != "" {
+			return a.Description
+		}
+		return a.Value.JSON("", "")
+	case "function":
+		if a.Description != "" {
+			// Just the signature line.
+			return strings.SplitN(a.Description, "\n", 2)[0]
+		}
+		return "function"
+	default:
+		if a.Description != "" {
+			return a.Description
+		}
+		return a.Value.JSON("", "")
+	}
+}
+
+// cmdInternalConsoleLogger is a hidden subcommand:
+//
+//	rodney _console_logger <debug_url> <log_path>
+//
+// It attaches to Chrome via CDP, subscribes to Runtime.consoleAPICalled +
+// Runtime.exceptionThrown for the whole browser, and appends each event as
+// a JSON line to <log_path>. It exits when Chrome dies or it is killed.
+func cmdInternalConsoleLogger(args []string) {
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	debugURL := args[0]
+	logPath := args[1]
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		os.Exit(2)
+	}
+	defer f.Close()
+
+	// NoDefaultDevice: don't apply 1280x800 desktop emulation to live pages.
+	// The console-logger only reads runtime events, but the rod browser
+	// instance still touches each page's emulation settings on connect.
+	browser := rod.New().ControlURL(debugURL).NoDefaultDevice()
+	if err := browser.Connect(); err != nil {
+		os.Exit(2)
+	}
+
+	// rod does not auto-enable the Runtime domain on attached sessions, and
+	// console events only fire from sessions where Runtime.enable was called.
+	// Enable it on every currently-open page. Pages opened later (rodney
+	// newpage, popups) are picked up by the periodic refresh below.
+	//
+	// We also (re-)apply Network.setCacheDisabled here when the persisted
+	// no-cache flag is on. The sidecar's CDP session is long-lived, so the
+	// flag stays asserted for the page's lifetime — which is what makes
+	// browser-UI reloads (F5) and DevTools reloads bypass cache, not just
+	// rodney-driven navigation. The per-command re-apply (cmdStart's
+	// connect-per-command path) only covers rodney-initiated work.
+	applyPerPageHooks := func() {
+		// Re-read state on every tick so `rodney no-cache off` takes effect
+		// without bouncing the sidecar.
+		noCache := false
+		if s, err := loadState(); err == nil {
+			noCache = s.NoCacheDisabled
+		}
+		if pages, err := browser.Pages(); err == nil {
+			for _, p := range pages {
+				_ = proto.RuntimeEnable{}.Call(p)
+				if noCache {
+					_ = proto.NetworkEnable{}.Call(p)
+					_ = proto.NetworkSetCacheDisabled{CacheDisabled: true}.Call(p)
+				}
+			}
+		}
+	}
+	applyPerPageHooks()
+	// Cheap periodic re-apply handles newly-opened tabs and state changes.
+	// Both RuntimeEnable and NetworkSetCacheDisabled are idempotent server-
+	// side, so spamming them is harmless.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			applyPerPageHooks()
+		}
+	}()
+
+	enc := json.NewEncoder(f)
+
+	wait := browser.EachEvent(
+		func(e *proto.RuntimeConsoleAPICalled) {
+			parts := make([]string, 0, len(e.Args))
+			for _, a := range e.Args {
+				parts = append(parts, renderConsoleArg(a))
+			}
+			entry := consoleLogEntry{
+				TS:    time.Now().UTC().Format(time.RFC3339Nano),
+				Src:   "console",
+				Level: string(e.Type),
+				Text:  strings.Join(parts, " "),
+			}
+			if e.StackTrace != nil && len(e.StackTrace.CallFrames) > 0 {
+				cf := e.StackTrace.CallFrames[0]
+				if cf.URL != "" {
+					entry.Loc = fmt.Sprintf("%s:%d", cf.URL, cf.LineNumber)
+				}
+			}
+			_ = enc.Encode(entry)
+		},
+		func(e *proto.RuntimeExceptionThrown) {
+			text := e.ExceptionDetails.Text
+			if e.ExceptionDetails.Exception != nil && e.ExceptionDetails.Exception.Description != "" {
+				text = text + ": " + e.ExceptionDetails.Exception.Description
+			}
+			entry := consoleLogEntry{
+				TS:    time.Now().UTC().Format(time.RFC3339Nano),
+				Src:   "exception",
+				Level: "error",
+				Text:  text,
+			}
+			if e.ExceptionDetails.URL != "" {
+				entry.Loc = fmt.Sprintf("%s:%d", e.ExceptionDetails.URL, e.ExceptionDetails.LineNumber)
+			}
+			_ = enc.Encode(entry)
+		},
+	)
+	wait()
+	os.Exit(0)
+}
+
+// cmdConsole reads the JSON-Lines file written by the sidecar and prints
+// filtered entries to stdout.
+func cmdConsole(args []string) {
+	fs := flag.NewFlagSet("console", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	pattern := fs.String("pattern", "", "")
+	limit := fs.Int("limit", 50, "")
+	errorsOnly := fs.Bool("errors-only", false, "")
+	clear := fs.Bool("clear", false, "")
+	raw := fs.Bool("raw", false, "")
+	if err := fs.Parse(args); err != nil {
+		fatal("invalid flag: %v", err)
+	}
+
+	path := consoleLogPath()
+
+	if *clear {
+		if err := os.WriteFile(path, []byte{}, 0644); err != nil {
+			fatal("failed to clear console log: %v", err)
+		}
+		fmt.Println("Console log cleared")
+		return
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // no entries yet — silent
+		}
+		fatal("failed to open console log: %v", err)
+	}
+	defer f.Close()
+
+	var re *regexp.Regexp
+	if *pattern != "" {
+		re, err = regexp.Compile(*pattern)
+		if err != nil {
+			fatal("invalid --pattern regex: %v", err)
+		}
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var entries []consoleLogEntry
+	for scanner.Scan() {
+		var entry consoleLogEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if *errorsOnly && entry.Level != "error" {
+			continue
+		}
+		if re != nil && !re.MatchString(entry.Text) {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+
+	if *limit > 0 && len(entries) > *limit {
+		entries = entries[len(entries)-*limit:]
+	}
+
+	for _, entry := range entries {
+		if *raw {
+			b, _ := json.Marshal(entry)
+			fmt.Println(string(b))
+			continue
+		}
+		ts := entry.TS
+		if t, err := time.Parse(time.RFC3339Nano, entry.TS); err == nil {
+			ts = t.Local().Format("15:04:05.000")
+		}
+		loc := ""
+		if entry.Loc != "" {
+			loc = " (" + entry.Loc + ")"
+		}
+		fmt.Printf("[%s] %s/%s: %s%s\n", ts, entry.Src, entry.Level, entry.Text, loc)
+	}
 }

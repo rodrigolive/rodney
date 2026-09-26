@@ -1590,3 +1590,72 @@ func TestApplyStealthFlags(t *testing.T) {
 		t.Errorf("stealth should disable the AutomationControlled blink feature, got %q", got)
 	}
 }
+
+// --- --page targeting (pure logic, no browser) ---
+
+func TestExtractPageArg(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantVal  string
+		wantRest []string
+	}{
+		{"absent", []string{"click", "#x"}, "", []string{"click", "#x"}},
+		{"spaced", []string{"--page", "2", "#x"}, "2", []string{"#x"}},
+		{"equals", []string{"--page=qa", "#x"}, "qa", []string{"#x"}},
+		{"substring with spaces consumed", []string{"--page", "Index.xsqlx", "document.title"}, "Index.xsqlx", []string{"document.title"}},
+		{"last wins", []string{"--page", "1", "--page=2"}, "2", nil},
+		{"trailing flag no value", []string{"#x", "--page"}, "", []string{"#x"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotVal, gotRest := extractPageArg(c.args)
+			if gotVal != c.wantVal {
+				t.Errorf("value = %q, want %q", gotVal, c.wantVal)
+			}
+			if strings.Join(gotRest, "\x00") != strings.Join(c.wantRest, "\x00") {
+				t.Errorf("rest = %v, want %v", gotRest, c.wantRest)
+			}
+		})
+	}
+}
+
+func TestResolvePageIndex(t *testing.T) {
+	refs := []pageRef{
+		{URL: "https://piresqa.aws.fao.org/ng/app/Index.xsqlx", Title: "PIRES"},
+		{URL: "file:///C:/tmp/explainer.html", Title: "UNSDCF Dataflow"},
+		{URL: "https://login.microsoftonline.com/x", Title: "Sign in"},
+	}
+
+	t.Run("numeric in range", func(t *testing.T) {
+		if i, err := resolvePageIndex(refs, "1"); err != nil || i != 1 {
+			t.Errorf("got (%d, %v), want (1, nil)", i, err)
+		}
+	})
+	t.Run("numeric out of range", func(t *testing.T) {
+		if _, err := resolvePageIndex(refs, "9"); err == nil {
+			t.Error("expected out-of-range error")
+		}
+	})
+	t.Run("unique substring on URL", func(t *testing.T) {
+		if i, err := resolvePageIndex(refs, "piresqa"); err != nil || i != 0 {
+			t.Errorf("got (%d, %v), want (0, nil)", i, err)
+		}
+	})
+	t.Run("substring on title case-insensitive", func(t *testing.T) {
+		if i, err := resolvePageIndex(refs, "unsdcf"); err != nil || i != 1 {
+			t.Errorf("got (%d, %v), want (1, nil)", i, err)
+		}
+	})
+	t.Run("no match", func(t *testing.T) {
+		if _, err := resolvePageIndex(refs, "nope"); err == nil {
+			t.Error("expected no-match error")
+		}
+	})
+	t.Run("ambiguous match", func(t *testing.T) {
+		// "https" appears in two URLs
+		if _, err := resolvePageIndex(refs, "https"); err == nil {
+			t.Error("expected ambiguous-match error")
+		}
+	})
+}
