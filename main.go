@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +24,7 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 )
 
 //go:embed help.txt
@@ -40,6 +43,48 @@ const (
 
 // activeStateDir is set once at startup based on --local/--global flags.
 var activeStateDir string
+
+// activeSession is set from --session NAME or RODNEY_SESSION. When non-empty it
+// isolates state under <base>/sessions/<name>, giving each agent its own Chrome
+// instance (the recommended pattern for running many agents in parallel).
+var activeSession string
+
+// activeTarget is set from --target ID or RODNEY_TARGET. When non-empty every
+// command operates on the tab with that target id instead of the shared
+// "active page", letting multiple agents share one Chrome without clobbering
+// each other's current tab.
+var activeTarget string
+
+// extractValueFlag removes "--name value" or "--name=value" from args and
+// returns the value (last occurrence wins) plus the remaining args. Used for the
+// global --session/--target flags, which may appear anywhere in the command.
+func extractValueFlag(args []string, name string) (string, []string) {
+	value := ""
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == name:
+			if i+1 < len(args) {
+				value = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, name+"="):
+			value = a[len(name)+1:]
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return value, rest
+}
+
+// sanitizeSession keeps a session name from escaping the sessions/ directory.
+func sanitizeSession(name string) string {
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "\\", "_")
+	name = strings.ReplaceAll(name, "..", "_")
+	return name
+}
 
 // extractScopeArgs scans args for --local/--global, removes them, and returns the mode.
 // If both appear, the last one wins.
@@ -79,17 +124,19 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL     string `json:"debug_url"`
+	ChromePID    int    `json:"chrome_pid"`
+	ActivePage   int    `json:"active_page"`             // legacy: index into the (stably sorted) pages list
+	ActiveTarget string `json:"active_target,omitempty"` // stable target id of the active tab
+	DataDir      string `json:"data_dir"`
+	ProxyPID     int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
+	ProxyPort    int    `json:"proxy_port,omitempty"` // local port of auth proxy
 
 	Extensions []extensionInfo `json:"extensions,omitempty"` // extensions passed to --load-extension
 }
 
-func stateDir() string {
+// baseStateDir resolves the data directory before any --session scoping.
+func baseStateDir() string {
 	if dir := os.Getenv("RODNEY_HOME"); dir != "" {
 		return dir
 	}
@@ -98,6 +145,14 @@ func stateDir() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".rodney")
+}
+
+func stateDir() string {
+	base := baseStateDir()
+	if activeSession != "" {
+		return filepath.Join(base, "sessions", sanitizeSession(activeSession))
+	}
+	return base
 }
 
 func statePath() string {
@@ -116,19 +171,41 @@ func loadState() (*State, error) {
 	return &s, nil
 }
 
+// saveState writes state.json atomically (temp file + rename) so a concurrent
+// reader or a second agent writing at the same time can never observe a
+// half-written, corrupt file.
 func saveState(s *State) error {
-	if err := os.MkdirAll(stateDir(), 0755); err != nil {
+	dir := stateDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(statePath(), data, 0644)
+	tmp, err := os.CreateTemp(dir, "state-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, statePath()); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func removeState() {
-	os.Remove(statePath())
+	_ = os.Remove(statePath())
 }
 
 // connectBrowser connects to the running Chrome instance
@@ -140,14 +217,93 @@ func connectBrowser(s *State) (*rod.Browser, error) {
 	return browser, nil
 }
 
-// getActivePage returns the currently active page
-func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
+// orderedPages returns the browser's pages in a stable order (sorted by target
+// id). Chrome's own target ordering is not guaranteed — newly opened tabs can
+// appear first — so without this a positional index like "page 1" would point
+// at different tabs across invocations. Sorting by the immutable target id makes
+// index N map to the same tab as long as the set of tabs is unchanged.
+func orderedPages(browser *rod.Browser) (rod.Pages, error) {
 	pages, err := browser.Pages()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pages: %w", err)
 	}
+	slices.SortFunc(pages, func(a, b *rod.Page) int {
+		return cmp.Compare(string(a.TargetID), string(b.TargetID))
+	})
+	return pages, nil
+}
+
+// matchTargetID resolves a target-id query against the available ids: an exact
+// match wins, otherwise a unique prefix match. The errors are written for an
+// agent to act on (no match / ambiguous), not a stack trace.
+func matchTargetID(ids []string, query string) (int, error) {
+	for i, id := range ids {
+		if id == query {
+			return i, nil
+		}
+	}
+	match := -1
+	for i, id := range ids {
+		if strings.HasPrefix(id, query) {
+			if match >= 0 {
+				return -1, fmt.Errorf("target id %q is ambiguous; use the full id from 'rodney pages'", query)
+			}
+			match = i
+		}
+	}
+	if match < 0 {
+		return -1, fmt.Errorf("no tab with target id %q (run 'rodney pages' to list open tabs)", query)
+	}
+	return match, nil
+}
+
+// targetIDs returns the target ids of pages in order.
+func targetIDs(pages rod.Pages) []string {
+	ids := make([]string, len(pages))
+	for i, p := range pages {
+		ids[i] = string(p.TargetID)
+	}
+	return ids
+}
+
+// pageByTarget finds the page whose target id matches query (exact or unique prefix).
+func pageByTarget(pages rod.Pages, query string) (*rod.Page, error) {
+	idx, err := matchTargetID(targetIDs(pages), query)
+	if err != nil {
+		return nil, err
+	}
+	return pages[idx], nil
+}
+
+// setActivePage records both the stable target id and the legacy index for the
+// chosen tab, so the active tab survives later tabs opening or closing.
+func setActivePage(s *State, pages rod.Pages, idx int) {
+	s.ActivePage = idx
+	if idx >= 0 && idx < len(pages) {
+		s.ActiveTarget = string(pages[idx].TargetID)
+	}
+}
+
+// getActivePage returns the page a command should act on. Resolution order:
+//  1. an explicit per-invocation --target / RODNEY_TARGET override,
+//  2. the stable active target id stored in state (survives reordering),
+//  3. the legacy active-page index, clamped into range.
+func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
+	pages, err := orderedPages(browser)
+	if err != nil {
+		return nil, err
+	}
 	if len(pages) == 0 {
 		return nil, fmt.Errorf("no pages open")
+	}
+	if activeTarget != "" {
+		return pageByTarget(pages, activeTarget)
+	}
+	if s.ActiveTarget != "" {
+		if p, err := pageByTarget(pages, s.ActiveTarget); err == nil {
+			return p, nil
+		}
+		// The stored tab was closed; fall back to the index.
 	}
 	idx := s.ActivePage
 	if idx < 0 || idx >= len(pages) {
@@ -183,13 +339,31 @@ func findUnknownFlag(args []string, fs *flag.FlagSet) string {
 }
 
 func main() {
+	// Convert any Must*-style panic into a clean `error: …` + exit 2 so agents
+	// scripting rodney never get a raw Go stack trace. RODNEY_DEBUG=1 skips the
+	// guard so the full trace is preserved for development.
+	if os.Getenv("RODNEY_DEBUG") == "" {
+		defer func() {
+			if r := recover(); r != nil {
+				fatal("%v", r)
+			}
+		}()
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(2)
 	}
 
-	// Extract --local/--global from all args before dispatching
+	// Extract the global flags (--local/--global, --session, --target) from all
+	// args before dispatching, so they can appear anywhere in the command.
 	mode, cleanedArgs := extractScopeArgs(os.Args[1:])
+	var sessionVal, targetVal string
+	sessionVal, cleanedArgs = extractValueFlag(cleanedArgs, "--session")
+	targetVal, cleanedArgs = extractValueFlag(cleanedArgs, "--target")
+	activeSession = cmp.Or(sessionVal, os.Getenv("RODNEY_SESSION"))
+	activeTarget = cmp.Or(targetVal, os.Getenv("RODNEY_TARGET"))
+
 	if len(cleanedArgs) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -219,6 +393,8 @@ func main() {
 		cmdStatus(args)
 	case "extensions":
 		cmdExtensions(args)
+	case "version":
+		fmt.Println(version)
 	case "open":
 		cmdOpen(args)
 	case "back":
@@ -302,9 +478,65 @@ func main() {
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
-		printUsage()
+		if suggestion := suggestCommand(cmd, commandNames); suggestion != "" {
+			fmt.Fprintf(os.Stderr, "did you mean '%s'? run 'rodney help' for all commands\n", suggestion)
+		} else {
+			fmt.Fprintln(os.Stderr, "run 'rodney help' for the list of commands")
+		}
 		os.Exit(2)
 	}
+}
+
+// commandNames lists every dispatchable command, used to suggest a correction
+// when an agent mistypes one.
+var commandNames = []string{
+	"start", "connect", "stop", "status", "version",
+	"open", "back", "forward", "reload", "clear-cache",
+	"url", "title", "html", "text", "attr", "pdf",
+	"js", "click", "input", "clear", "select", "submit", "hover", "file", "download", "focus",
+	"wait", "waitload", "waitstable", "waitidle", "sleep",
+	"screenshot", "screenshot-el",
+	"pages", "page", "newpage", "closepage",
+	"exists", "count", "visible", "assert",
+	"ax-tree", "ax-find", "ax-node",
+	"help",
+}
+
+// suggestCommand returns the closest command name within a small edit distance,
+// or "" when the input is too far from anything to be a useful suggestion.
+func suggestCommand(input string, commands []string) string {
+	best, bestDist := "", -1
+	for _, c := range commands {
+		d := levenshtein(input, c)
+		if bestDist < 0 || d < bestDist {
+			best, bestDist = c, d
+		}
+	}
+	if bestDist >= 0 && bestDist <= 2 {
+		return best
+	}
+	return ""
+}
+
+// levenshtein computes the edit distance between two strings.
+func levenshtein(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
 }
 
 // Default timeout for element queries (seconds)
@@ -318,9 +550,15 @@ func init() {
 	}
 }
 
-// withPage loads state, connects, and returns the active page.
-// Caller should NOT close the browser (we just disconnect).
+// withPage loads state, connects, and returns the active page with the default
+// timeout applied. Caller should NOT close the browser (we just disconnect).
 func withPage() (*State, *rod.Browser, *rod.Page) {
+	return withPageTimeout(defaultTimeout)
+}
+
+// withPageTimeout is like withPage but applies a caller-chosen timeout so
+// element queries and waits don't hang forever.
+func withPageTimeout(timeout time.Duration) (*State, *rod.Browser, *rod.Page) {
 	s, err := loadState()
 	if err != nil {
 		fatal("%v", err)
@@ -333,9 +571,164 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	// Apply default timeout so element queries don't hang forever
-	page = page.Timeout(defaultTimeout)
-	return s, browser, page
+	return s, browser, page.Timeout(timeout)
+}
+
+// parseFlagsInterspersed parses fs against args where flags and positional
+// arguments may appear in any order (a plain flag.FlagSet stops at the first
+// non-flag). Returns the positional args in their original order.
+func parseFlagsInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			break
+		}
+		positionals = append(positionals, args[0])
+		args = args[1:]
+	}
+	return positionals, nil
+}
+
+// resolveTimeout returns the page timeout to use: the --timeout flag value (in
+// seconds) when positive, otherwise the global defaultTimeout.
+func resolveTimeout(flagSecs float64) time.Duration {
+	if flagSecs > 0 {
+		return time.Duration(flagSecs * float64(time.Second))
+	}
+	return defaultTimeout
+}
+
+// parseTimeoutArgs extracts an optional --timeout <sec> flag (which may appear
+// anywhere among args) and returns the resolved page timeout plus the remaining
+// positional args. On an unknown flag it prints usage and exits.
+func parseTimeoutArgs(name string, args []string) (time.Duration, []string) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	secs := fs.Float64("timeout", 0, "")
+	positionals, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		fatal("unknown flag: %s", findUnknownFlag(args, fs))
+	}
+	return resolveTimeout(*secs), positionals
+}
+
+// navHint returns an actionable suffix when err looks like the browser
+// connection died (e.g. a crashed tab took the whole session down), else "".
+func navHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	for _, sig := range []string{"EOF", "use of closed", "connection refused", "websocket"} {
+		if strings.Contains(msg, sig) {
+			return "; the browser may have crashed — run 'rodney start' to restart it"
+		}
+	}
+	return ""
+}
+
+// waitPageReady blocks until the page reaches the given readiness, honoring the
+// page's timeout. mode is "load" (default), "domcontentloaded", or "none".
+func waitPageReady(page *rod.Page, mode string) error {
+	switch mode {
+	case "none":
+		return nil
+	case "", "load":
+		return page.WaitLoad()
+	case "domcontentloaded":
+		_, err := page.Evaluate(rod.Eval(`() => new Promise(resolve => {
+			if (document.readyState !== 'loading') { resolve(true); return; }
+			document.addEventListener('DOMContentLoaded', () => resolve(true), { once: true });
+		})`).ByPromise())
+		return err
+	default:
+		return fmt.Errorf("invalid wait mode %q (want load, domcontentloaded, or none)", mode)
+	}
+}
+
+// navigateCapturingStatus navigates to url and returns the HTTP status of the
+// main document response (0 if it could not be observed within the page timeout).
+func navigateCapturingStatus(page *rod.Page, url string) (int, error) {
+	_ = proto.NetworkEnable{}.Call(page)
+	var status int
+	wait := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
+		if e.Type == proto.NetworkResourceTypeDocument && e.Response != nil {
+			status = e.Response.Status
+			return true
+		}
+		return false
+	})
+	if err := page.Navigate(url); err != nil {
+		return 0, err
+	}
+	wait()
+	return status, nil
+}
+
+// formatEvalValue renders a JS eval result: strings unquoted, objects/arrays
+// pretty-printed as JSON, everything else as its JSON form.
+func formatEvalValue(v gson.JSON) string {
+	raw := v.JSON("", "")
+	switch {
+	case raw == "null" || raw == "undefined":
+		return raw
+	case raw == "true" || raw == "false":
+		return raw
+	case len(raw) > 0 && raw[0] == '"':
+		return v.Str()
+	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
+		return v.JSON("", "  ")
+	default:
+		return raw
+	}
+}
+
+// evalJSExpr evaluates a bare JS expression on the page and returns its printable
+// form. When asJSON is true the value is JSON.stringify'd and pretty-printed so
+// the output is always valid JSON (ideal for piping to jq/jaq).
+func evalJSExpr(page *rod.Page, expr string, asJSON bool) (string, error) {
+	if asJSON {
+		result, err := page.Eval(fmt.Sprintf(`() => JSON.stringify((%s) ?? null)`, expr))
+		if err != nil {
+			return "", err
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(result.Value.Str()), &parsed); err != nil {
+			return "", fmt.Errorf("result is not JSON-serializable: %w", err)
+		}
+		out, err := json.MarshalIndent(parsed, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	}
+	result, err := page.Eval(fmt.Sprintf(`() => { return (%s); }`, expr))
+	if err != nil {
+		return "", err
+	}
+	return formatEvalValue(result.Value), nil
+}
+
+// applyUserAgent overrides the page's User-Agent for subsequent requests.
+func applyUserAgent(page *rod.Page, ua string) error {
+	return page.SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: ua})
+}
+
+// stealthUserAgent is a realistic desktop Chrome UA used by --stealth when no
+// explicit --user-agent is given, so the headless give-away ("HeadlessChrome")
+// is removed from requests.
+const stealthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// applyStealthFlags sets launcher flags that hide the most common headless
+// automation tells (navigator.webdriver via AutomationControlled, and the
+// automation banner). Lightweight, launch-only — not a full anti-bot bypass.
+func applyStealthFlags(l *launcher.Launcher) {
+	l.Set("disable-blink-features", "AutomationControlled")
+	l.Delete("enable-automation")
 }
 
 // bringToFront makes page the browser's foreground target.
@@ -361,36 +754,42 @@ func bringToFront(page *rod.Page) {
 
 // --- Commands ---
 
-const startUsage = "usage: rodney start [--show] [--insecure] [--extension PATH]"
+const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth] [--replace] [--extension PATH]"
 
-// startOptions holds the parsed flags for the "start" command.
-type startOptions struct {
-	ignoreCertErrors bool
-	headless         bool
-	extensions       []string
+// startOpts holds the parsed flags for the "start" command.
+type startOpts struct {
+	insecure   bool
+	headless   bool
+	userAgent  string
+	stealth    bool
+	replace    bool
+	extensions []string
 }
 
 // parseStartArgs parses the flags for the "start" command.
-func parseStartArgs(args []string) (startOptions, error) {
-	opts := startOptions{headless: true}
-	var extensions extensionList
-
+func parseStartArgs(args []string) (startOpts, error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.BoolVar(&opts.ignoreCertErrors, "insecure", false, "")
-	fs.BoolVar(&opts.ignoreCertErrors, "k", false, "")
+	var o startOpts
+	var extensions extensionList
+	fs.BoolVar(&o.insecure, "insecure", false, "")
+	fs.BoolVar(&o.insecure, "k", false, "")
+	fs.StringVar(&o.userAgent, "user-agent", "", "")
+	fs.BoolVar(&o.stealth, "stealth", false, "")
+	fs.BoolVar(&o.replace, "replace", false, "")
+	fs.BoolVar(&o.replace, "force", false, "")
 	fs.Var(&extensions, "extension", "")
 	show := fs.Bool("show", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
-		return startOptions{headless: true}, fmt.Errorf("unknown flag: %s\n%s", findUnknownFlag(args, fs), startUsage)
+		return startOpts{headless: true}, fmt.Errorf("unknown flag: %s\n%s", findUnknownFlag(args, fs), startUsage)
 	}
 	if fs.NArg() > 0 {
-		return startOptions{headless: true}, fmt.Errorf("unknown flag: %s\n%s", fs.Arg(0), startUsage)
+		return startOpts{headless: true}, fmt.Errorf("unknown flag: %s\n%s", fs.Arg(0), startUsage)
 	}
-	opts.headless = !*show
-	opts.extensions = extensions
-	return opts, nil
+	o.headless = !*show
+	o.extensions = extensions
+	return o, nil
 }
 
 func cmdStart(args []string) {
@@ -398,20 +797,36 @@ func cmdStart(args []string) {
 	if err != nil {
 		fatal("%s", err)
 	}
-	ignoreCertErrors, headless := opts.ignoreCertErrors, opts.headless
+	ignoreCertErrors, headless := opts.insecure, opts.headless
 
-	// Check if already running
+	// If a session already exists, default to reusing it rather than killing it —
+	// re-running `start` must never silently nuke a live browser (and any tabs a
+	// peer agent is using). --replace forces a fresh browser.
 	if s, err := loadState(); err == nil {
-		// Try connecting
 		if b, err := connectBrowser(s); err == nil {
+			if !opts.replace {
+				// Reuse: just disconnect (do NOT Close — that would kill Chrome).
+				fmt.Printf("Chrome already running (PID %d)\n", s.ChromePID)
+				fmt.Printf("Debug URL: %s\n", s.DebugURL)
+				fmt.Println("Reusing the existing session (use 'rodney start --replace' to restart it)")
+				return
+			}
 			b.MustClose()
-			// It was actually running, warn
 			removeState()
+		}
+		// Either we are replacing, or the old browser is dead; clean up any
+		// stale auth-proxy helper before launching a new one.
+		if s.ProxyPID > 0 {
+			if proc, perr := os.FindProcess(s.ProxyPID); perr == nil {
+				_ = proc.Signal(syscall.SIGTERM)
+			}
 		}
 	}
 
 	dataDir := filepath.Join(stateDir(), "chrome-data")
-	os.MkdirAll(dataDir, 0755)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		fatal("failed to create data dir: %v", err)
+	}
 
 	extensions := loadExtensions(opts.extensions)
 
@@ -440,6 +855,19 @@ func cmdStart(args []string) {
 		l = l.Bin(bin)
 	}
 
+	// Stealth + user-agent: --stealth hides the headless automation tells and,
+	// absent an explicit --user-agent, swaps in a non-headless UA.
+	ua := opts.userAgent
+	if opts.stealth {
+		applyStealthFlags(l)
+		if ua == "" {
+			ua = stealthUserAgent
+		}
+	}
+	if ua != "" {
+		l.Set("user-agent", ua)
+	}
+
 	// Detect authenticated proxy and launch helper if needed
 	var proxyPID, proxyPort int
 	if server, user, pass, needed := detectProxy(); needed {
@@ -451,7 +879,7 @@ func cmdStart(args []string) {
 			fatal("failed to find free port for proxy: %v", err)
 		}
 		proxyPort = ln.Addr().(*net.TCPAddr).Port
-		ln.Close()
+		_ = ln.Close()
 
 		// Launch ourselves as the proxy helper in the background
 		exe, _ := os.Executable()
@@ -463,7 +891,7 @@ func cmdStart(args []string) {
 		}
 		proxyPID = cmd.Process.Pid
 		// Detach so it survives after we exit
-		cmd.Process.Release()
+		_ = cmd.Process.Release()
 
 		// Wait for the proxy to be ready
 		time.Sleep(500 * time.Millisecond)
@@ -551,7 +979,7 @@ func cmdConnect(args []string) {
 	if err != nil {
 		fatal("could not reach browser at %s: %v", hostport, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fatal("failed to read response: %v", err)
@@ -594,7 +1022,7 @@ func cmdStop(args []string) {
 		if s.ChromePID > 0 {
 			proc, err := os.FindProcess(s.ChromePID)
 			if err == nil {
-				proc.Signal(syscall.SIGTERM)
+				_ = proc.Signal(syscall.SIGTERM)
 			}
 		}
 	} else if s.ChromePID > 0 {
@@ -605,7 +1033,7 @@ func cmdStop(args []string) {
 	// Also kill the proxy helper if running
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
-			proc.Signal(syscall.SIGTERM)
+			_ = proc.Signal(syscall.SIGTERM)
 		}
 	}
 	removeState()
@@ -613,6 +1041,7 @@ func cmdStop(args []string) {
 }
 
 func cmdStatus(args []string) {
+	fmt.Printf("rodney %s\n", version)
 	s, err := loadState()
 	if err != nil {
 		fmt.Println("No active browser session")
@@ -625,13 +1054,17 @@ func cmdStatus(args []string) {
 	}
 	pages, _ := browser.Pages()
 	fmt.Printf("Browser running (PID %d)\n", s.ChromePID)
+	fmt.Printf("State dir: %s\n", stateDir())
+	if activeSession != "" {
+		fmt.Printf("Session: %s\n", activeSession)
+	}
 	fmt.Printf("Debug URL: %s\n", s.DebugURL)
 	fmt.Printf("Pages: %d\n", len(pages))
-	fmt.Printf("Active page: %d\n", s.ActivePage)
 	for _, ext := range s.Extensions {
 		fmt.Printf("Extension: %s (%s)\n", ext.Name, ext.ID)
 	}
 	if page, err := getActivePage(browser, s); err == nil {
+		fmt.Printf("Active target: %s\n", page.TargetID)
 		info, _ := page.Info()
 		if info != nil {
 			fmt.Printf("Current: %s - %s\n", info.Title, info.URL)
@@ -639,12 +1072,38 @@ func cmdStatus(args []string) {
 	}
 }
 
+const openUsage = "usage: rodney open <url> [--no-wait] [--wait load|domcontentloaded|none] [--timeout SEC] [--expect-ok] [--then-js EXPR] [--user-agent UA]"
+
 func cmdOpen(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney open <url>")
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	noWait := fs.Bool("no-wait", false, "")
+	waitMode := fs.String("wait", "load", "")
+	timeoutSecs := fs.Float64("timeout", 0, "")
+	expectOK := fs.Bool("expect-ok", false, "")
+	thenJS := fs.String("then-js", "", "")
+	userAgent := fs.String("user-agent", "", "")
+
+	positionals, err := parseFlagsInterspersed(fs, args)
+	if err != nil {
+		fatal("unknown flag: %s\n%s", findUnknownFlag(args, fs), openUsage)
 	}
-	url := args[0]
-	// Add scheme if missing
+	if len(positionals) < 1 {
+		fatal("%s", openUsage)
+	}
+
+	mode := *waitMode
+	if *noWait {
+		mode = "none"
+	}
+	switch mode {
+	case "none", "load", "domcontentloaded":
+	default:
+		fatal("invalid --wait %q (want load, domcontentloaded, or none)", mode)
+	}
+	timeout := resolveTimeout(*timeoutSecs)
+
+	url := positionals[0]
 	if !strings.Contains(url, "://") {
 		url = "http://" + url
 	}
@@ -658,23 +1117,72 @@ func cmdOpen(args []string) {
 		fatal("%v", err)
 	}
 
-	// If no pages exist, create one
+	// Ensure there's a page to navigate, creating a blank one if none exist, so
+	// the navigation path (and status capture) is uniform.
 	pages, _ := browser.Pages()
 	var page *rod.Page
 	if len(pages) == 0 {
-		page = browser.MustPage(url)
-		s.ActivePage = 0
-		saveState(s)
+		page, err = browser.Page(proto.TargetCreateTarget{})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
+		// Record the new tab as active by its stable target id (unless the caller
+		// pinned a specific --target, which getActivePage would honor instead).
+		if activeTarget == "" {
+			s.ActivePage = 0
+			s.ActiveTarget = string(page.TargetID)
+			_ = saveState(s)
+		}
 	} else {
 		page, err = getActivePage(browser, s)
 		if err != nil {
 			fatal("%v", err)
 		}
-		if err := page.Navigate(url); err != nil {
-			fatal("navigation failed: %v", err)
+	}
+	page = page.Timeout(timeout)
+
+	if *userAgent != "" {
+		if err := applyUserAgent(page, *userAgent); err != nil {
+			fatal("failed to set user agent: %v", err)
 		}
 	}
-	page.MustWaitLoad()
+
+	// Capture the document status only when --expect-ok asks for it (it adds a
+	// NetworkResponseReceived round-trip we don't want on the common path).
+	var status int
+	if *expectOK {
+		status, err = navigateCapturingStatus(page, url)
+	} else {
+		err = page.Navigate(url)
+	}
+	if err != nil {
+		fatal("navigation failed: %v%s", err, navHint(err))
+	}
+
+	if err := waitPageReady(page, mode); err != nil {
+		fatal("page did not finish loading within %s: %v%s", timeout, err, navHint(err))
+	}
+
+	if *expectOK {
+		if status >= 400 {
+			fatal("HTTP %d response from %s", status, url)
+		}
+		if status > 0 {
+			fmt.Fprintf(os.Stderr, "HTTP %d\n", status)
+		}
+	}
+
+	// --then-js folds navigate + extract into one process (cheaper for bulk
+	// lookups); otherwise print the page title as before.
+	if *thenJS != "" {
+		out, err := evalJSExpr(page, *thenJS, false)
+		if err != nil {
+			fatal("JS error: %v%s", err, navHint(err))
+		}
+		fmt.Println(out)
+		return
+	}
+
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.Title)
@@ -683,8 +1191,12 @@ func cmdOpen(args []string) {
 
 func cmdBack(args []string) {
 	_, _, page := withPage()
-	page.MustNavigateBack()
-	page.MustWaitLoad()
+	if err := page.NavigateBack(); err != nil {
+		fatal("back failed: %v%s", err, navHint(err))
+	}
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+	}
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.URL)
@@ -693,8 +1205,12 @@ func cmdBack(args []string) {
 
 func cmdForward(args []string) {
 	_, _, page := withPage()
-	page.MustNavigateForward()
-	page.MustWaitLoad()
+	if err := page.NavigateForward(); err != nil {
+		fatal("forward failed: %v%s", err, navHint(err))
+	}
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+	}
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.URL)
@@ -705,18 +1221,25 @@ func cmdReload(args []string) {
 	fs := flag.NewFlagSet("reload", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	hard := fs.Bool("hard", false, "")
-	fs.Parse(args)
-	_, _, page := withPage()
+	timeoutSecs := fs.Float64("timeout", 0, "")
+	if err := fs.Parse(args); err != nil {
+		fatal("unknown flag: %s\nusage: rodney reload [--hard] [--timeout SEC]", findUnknownFlag(args, fs))
+	}
+	timeout := resolveTimeout(*timeoutSecs)
+	_, _, page := withPageTimeout(timeout)
 	if *hard {
 		// CDP Page.reload with ignoreCache (equivalent to Shift+Refresh)
-		err := (proto.PageReload{IgnoreCache: true}).Call(page)
-		if err != nil {
-			fatal("reload failed: %v", err)
+		if err := (proto.PageReload{IgnoreCache: true}).Call(page); err != nil {
+			fatal("reload failed: %v%s", err, navHint(err))
 		}
 	} else {
-		page.MustReload()
+		if err := page.Reload(); err != nil {
+			fatal("reload failed: %v%s", err, navHint(err))
+		}
 	}
-	page.MustWaitLoad()
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Reloaded")
 }
 
@@ -766,11 +1289,12 @@ func cmdHTML(args []string) {
 }
 
 func cmdText(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney text <selector>")
+	timeout, pos := parseTimeoutArgs("text", args)
+	if len(pos) < 1 {
+		fatal("usage: rodney text <selector> [--timeout SEC]")
 	}
-	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	_, _, page := withPageTimeout(timeout)
+	el, err := page.Element(pos[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
@@ -793,8 +1317,9 @@ func cmdAttr(args []string) {
 	val := el.MustAttribute(args[1])
 	if val == nil {
 		fatal("attribute %q not found", args[1])
+	} else {
+		fmt.Println(*val)
 	}
-	fmt.Println(*val)
 }
 
 func cmdPDF(args []string) {
@@ -826,37 +1351,27 @@ func cmdPDF(args []string) {
 }
 
 func cmdJS(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney js <expression>")
+	// Flags must precede the expression (a JS expression can start with '-');
+	// use '--' to pass such an expression literally.
+	fs := flag.NewFlagSet("js", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	timeoutSecs := fs.Float64("timeout", 0, "")
+	jsonOut := fs.Bool("json", false, "")
+	if err := fs.Parse(args); err != nil {
+		fatal("unknown flag: %s\nusage: rodney js [--timeout SEC] [--json] <expression>", findUnknownFlag(args, fs))
 	}
-	expr := strings.Join(args, " ")
-	_, _, page := withPage()
+	rest := fs.Args()
+	if len(rest) < 1 {
+		fatal("usage: rodney js [--timeout SEC] [--json] <expression>")
+	}
+	expr := strings.Join(rest, " ")
+	_, _, page := withPageTimeout(resolveTimeout(*timeoutSecs))
 
-	// Wrap bare expressions in a function
-	js := fmt.Sprintf(`() => { return (%s); }`, expr)
-	result, err := page.Eval(js)
+	out, err := evalJSExpr(page, expr, *jsonOut)
 	if err != nil {
 		fatal("JS error: %v", err)
 	}
-	// Print the value based on its JSON type
-	v := result.Value
-	raw := v.JSON("", "")
-	// For simple types, print cleanly; for objects/arrays, pretty-print
-	switch {
-	case raw == "null" || raw == "undefined":
-		fmt.Println(raw)
-	case raw == "true" || raw == "false":
-		fmt.Println(raw)
-	case len(raw) > 0 && raw[0] == '"':
-		// String value - print unquoted
-		fmt.Println(v.Str())
-	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
-		// Object or array - pretty print
-		fmt.Println(v.JSON("", "  "))
-	default:
-		// Numbers and other primitives
-		fmt.Println(raw)
-	}
+	fmt.Println(out)
 }
 
 func cmdClick(args []string) {
@@ -927,10 +1442,12 @@ func cmdFile(args []string) {
 			fatal("failed to create temp file: %v", err)
 		}
 		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			fatal("failed to write temp file: %v", err)
 		}
-		tmp.Close()
+		if err := tmp.Close(); err != nil {
+			fatal("failed to close temp file: %v", err)
+		}
 		filePath = tmp.Name()
 	} else {
 		if _, err := os.Stat(filePath); err != nil {
@@ -1002,7 +1519,9 @@ func cmdDownload(args []string) {
 	}
 
 	if outFile == "-" {
-		os.Stdout.Write(data)
+		if _, err := os.Stdout.Write(data); err != nil {
+			fatal("failed to write output: %v", err)
+		}
 		return
 	}
 
@@ -1156,33 +1675,45 @@ func cmdFocus(args []string) {
 }
 
 func cmdWait(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney wait <selector>")
+	timeout, pos := parseTimeoutArgs("wait", args)
+	if len(pos) < 1 {
+		fatal("usage: rodney wait <selector> [--timeout SEC]")
 	}
-	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	_, _, page := withPageTimeout(timeout)
+	el, err := page.Element(pos[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
-	el.MustWaitVisible()
+	if err := el.WaitVisible(); err != nil {
+		fatal("element did not become visible within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Element visible")
 }
 
 func cmdWaitLoad(args []string) {
-	_, _, page := withPage()
-	page.MustWaitLoad()
+	timeout, _ := parseTimeoutArgs("waitload", args)
+	_, _, page := withPageTimeout(timeout)
+	if err := page.WaitLoad(); err != nil {
+		fatal("page did not finish loading within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Page loaded")
 }
 
 func cmdWaitStable(args []string) {
-	_, _, page := withPage()
-	page.MustWaitStable()
+	timeout, _ := parseTimeoutArgs("waitstable", args)
+	_, _, page := withPageTimeout(timeout)
+	if err := page.WaitStable(time.Second); err != nil {
+		fatal("DOM did not stabilize within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("DOM stable")
 }
 
 func cmdWaitIdle(args []string) {
-	_, _, page := withPage()
-	page.MustWaitIdle()
+	timeout, _ := parseTimeoutArgs("waitidle", args)
+	_, _, page := withPageTimeout(timeout)
+	if err := page.WaitIdle(timeout); err != nil {
+		fatal("network did not become idle within %s: %v%s", timeout, err, navHint(err))
+	}
 	fmt.Println("Network idle")
 }
 
@@ -1298,31 +1829,31 @@ func cmdPages(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	pages, err := orderedPages(browser)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
+	}
+	activeID := ""
+	if p, err := getActivePage(browser, s); err == nil {
+		activeID = string(p.TargetID)
 	}
 	for i, p := range pages {
 		marker := " "
-		if i == s.ActivePage {
+		if string(p.TargetID) == activeID {
 			marker = "*"
 		}
 		info, _ := p.Info()
 		if info != nil {
-			fmt.Printf("%s [%d] %s - %s\n", marker, i, info.Title, info.URL)
+			fmt.Printf("%s [%d] %s  %s - %s\n", marker, i, p.TargetID, info.Title, info.URL)
 		} else {
-			fmt.Printf("%s [%d] (unknown)\n", marker, i)
+			fmt.Printf("%s [%d] %s  (unknown)\n", marker, i, p.TargetID)
 		}
 	}
 }
 
 func cmdPage(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney page <index>")
-	}
-	idx, err := strconv.Atoi(args[0])
-	if err != nil {
-		fatal("invalid index: %v", err)
+		fatal("usage: rodney page <index|target-id>")
 	}
 	s, err := loadState()
 	if err != nil {
@@ -1332,14 +1863,23 @@ func cmdPage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	pages, err := orderedPages(browser)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
+	}
+	// Accept either a positional index or a (stable) target id, so callers can
+	// switch by the id printed by `pages`/`newpage` and not worry about ordering.
+	idx, err := strconv.Atoi(args[0])
+	if err != nil {
+		idx, err = matchTargetID(targetIDs(pages), args[0])
+		if err != nil {
+			fatal("%v", err)
+		}
 	}
 	if idx < 0 || idx >= len(pages) {
 		fatal("page index %d out of range (0-%d)", idx, len(pages)-1)
 	}
-	s.ActivePage = idx
+	setActivePage(s, pages, idx)
 	if err := saveState(s); err != nil {
 		fatal("failed to save state: %v", err)
 	}
@@ -1372,26 +1912,40 @@ func cmdNewPage(args []string) {
 
 	var page *rod.Page
 	if url != "" {
-		page = browser.MustPage(url)
-		page.MustWaitLoad()
+		page, err = browser.Page(proto.TargetCreateTarget{URL: url})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
+		page = page.Timeout(defaultTimeout)
+		if err := page.WaitLoad(); err != nil {
+			fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+		}
 	} else {
-		page = browser.MustPage("")
+		page, err = browser.Page(proto.TargetCreateTarget{})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
 	}
 
-	// Switch active to the new page
-	pages, _ := browser.Pages()
+	// Switch active to the new page, keyed by its stable target id.
+	pages, _ := orderedPages(browser)
 	for i, p := range pages {
 		if p.TargetID == page.TargetID {
-			s.ActivePage = i
+			setActivePage(s, pages, i)
 			break
 		}
 	}
-	saveState(s)
+	_ = saveState(s)
 
 	info, _ := page.Info()
+	url = ""
 	if info != nil {
-		fmt.Printf("Opened [%d] %s\n", s.ActivePage, info.URL)
+		url = info.URL
 	}
+	fmt.Printf("Opened [%d] %s\n", s.ActivePage, url)
+	// Print the target id on its own line so an agent can capture it and pin
+	// later commands with --target / RODNEY_TARGET.
+	fmt.Printf("target: %s\n", page.TargetID)
 }
 
 func cmdClosePage(args []string) {
@@ -1403,35 +1957,49 @@ func cmdClosePage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	pages, err := orderedPages(browser)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
 	}
 	if len(pages) <= 1 {
 		fatal("cannot close the last page")
 	}
 
-	idx := s.ActivePage
+	// Default to the resolved active tab; otherwise an index or a target id.
+	idx := -1
 	if len(args) > 0 {
 		idx, err = strconv.Atoi(args[0])
 		if err != nil {
-			fatal("invalid index: %v", err)
+			idx, err = matchTargetID(targetIDs(pages), args[0])
+			if err != nil {
+				fatal("%v", err)
+			}
 		}
+	} else if active, aerr := getActivePage(browser, s); aerr == nil {
+		idx = slices.IndexFunc(pages, func(p *rod.Page) bool { return p.TargetID == active.TargetID })
 	}
 	if idx < 0 || idx >= len(pages) {
-		fatal("page index %d out of range", idx)
+		fatal("page index %d out of range (0-%d)", idx, len(pages)-1)
 	}
 
+	closedID := string(pages[idx].TargetID)
 	pages[idx].MustClose()
 
-	// Adjust active page
-	if s.ActivePage >= len(pages)-1 {
-		s.ActivePage = len(pages) - 2
+	// Re-resolve the active tab. If we closed it (or nothing was tracked),
+	// default to the first remaining tab; otherwise keep pointing at the same id.
+	remaining, _ := orderedPages(browser)
+	if len(remaining) > 0 {
+		if s.ActiveTarget == "" || s.ActiveTarget == closedID {
+			setActivePage(s, remaining, 0)
+		} else if i := slices.IndexFunc(remaining, func(p *rod.Page) bool {
+			return string(p.TargetID) == s.ActiveTarget
+		}); i >= 0 {
+			setActivePage(s, remaining, i)
+		} else {
+			setActivePage(s, remaining, 0)
+		}
 	}
-	if s.ActivePage < 0 {
-		s.ActivePage = 0
-	}
-	saveState(s)
+	_ = saveState(s)
 	fmt.Printf("Closed page %d\n", idx)
 }
 
@@ -1675,7 +2243,9 @@ func cmdAXNode(args []string) {
 
 	fs := flag.NewFlagSet("ax-node", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.Parse(filtered)
+	if err := fs.Parse(filtered); err != nil {
+		fatal("%v", err)
+	}
 
 	if fs.NArg() < 1 {
 		fatal("usage: rodney ax-node <selector> [--json]")
@@ -1705,7 +2275,7 @@ func queryAXNodes(page *rod.Page, name, role string) ([]*proto.AccessibilityAXNo
 	}
 
 	result, err := proto.AccessibilityQueryAXTree{
-		BackendNodeID: doc.Root.BackendNodeID,
+		BackendNodeID:  doc.Root.BackendNodeID,
 		AccessibleName: name,
 		Role:           role,
 	}.Call(page)
@@ -1897,19 +2467,19 @@ func formatAXNodeList(nodes []*proto.AccessibilityAXNode) string {
 // formatAXNodeDetail formats a single node with all its properties in key: value format.
 func formatAXNodeDetail(node *proto.AccessibilityAXNode) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("role: %s\n", axValueStr(node.Role)))
+	fmt.Fprintf(&sb, "role: %s\n", axValueStr(node.Role))
 	if name := axValueStr(node.Name); name != "" {
-		sb.WriteString(fmt.Sprintf("name: %s\n", name))
+		fmt.Fprintf(&sb, "name: %s\n", name)
 	}
 	if desc := axValueStr(node.Description); desc != "" {
-		sb.WriteString(fmt.Sprintf("description: %s\n", desc))
+		fmt.Fprintf(&sb, "description: %s\n", desc)
 	}
 	if val := axValueStr(node.Value); val != "" {
-		sb.WriteString(fmt.Sprintf("value: %s\n", val))
+		fmt.Fprintf(&sb, "value: %s\n", val)
 	}
 	for _, p := range node.Properties {
 		val := axValueStr(p.Value)
-		sb.WriteString(fmt.Sprintf("%s: %s\n", p.Name, val))
+		fmt.Fprintf(&sb, "%s: %s\n", p.Name, val)
 	}
 	return sb.String()
 }
@@ -1978,7 +2548,9 @@ func cmdInternalProxy(args []string) {
 			}
 		}),
 	}
-	server.Serve(listener) // blocks forever
+	if err := server.Serve(listener); err != nil { // blocks until the server stops
+		fatal("proxy server failed: %v", err)
+	}
 }
 
 func proxyConnect(w http.ResponseWriter, r *http.Request, upstream, authHeader string) {
@@ -1991,7 +2563,7 @@ func proxyConnect(w http.ResponseWriter, r *http.Request, upstream, authHeader s
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
 		r.Host, r.Host, authHeader)
 	if _, err := upstreamConn.Write([]byte(connectReq)); err != nil {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "upstream write failed", http.StatusBadGateway)
 		return
 	}
@@ -1999,38 +2571,38 @@ func proxyConnect(w http.ResponseWriter, r *http.Request, upstream, authHeader s
 	buf := make([]byte, 4096)
 	n, err := upstreamConn.Read(buf)
 	if err != nil {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "upstream read failed", http.StatusBadGateway)
 		return
 	}
 	response := string(buf[:n])
 	if len(response) < 12 || response[9:12] != "200" {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "upstream rejected CONNECT", http.StatusBadGateway)
 		return
 	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		upstreamConn.Close()
+		_ = upstreamConn.Close()
 		return
 	}
 
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	go func() {
-		io.Copy(upstreamConn, clientConn)
-		upstreamConn.Close()
+		_, _ = io.Copy(upstreamConn, clientConn)
+		_ = upstreamConn.Close()
 	}()
 	go func() {
-		io.Copy(clientConn, upstreamConn)
-		clientConn.Close()
+		_, _ = io.Copy(clientConn, upstreamConn)
+		_ = clientConn.Close()
 	}()
 }
 
@@ -2049,7 +2621,7 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, upstream, authHeader stri
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -2057,5 +2629,5 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, upstream, authHeader stri
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }

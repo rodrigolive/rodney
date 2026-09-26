@@ -178,7 +178,7 @@ func TestParseStartArgs_ExtensionWithOtherFlags(t *testing.T) {
 	if opts.headless {
 		t.Error("expected headless=false when --show is passed")
 	}
-	if !opts.ignoreCertErrors {
+	if !opts.insecure {
 		t.Error("expected insecure=true when -k is passed")
 	}
 	if len(opts.extensions) != 1 {

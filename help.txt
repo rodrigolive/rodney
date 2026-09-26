@@ -1,32 +1,43 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--show] [--insecure | -k] [--extension PATH]
-                                  Launch Chrome (headless by default, --show for visible)
-                                  --extension loads an unpacked directory or a
-                                  .crx/.zip archive; repeat for several
+  rodney start [opts]             Launch Chrome (headless by default). Options:
+                                    --show           visible browser window
+                                    --insecure, -k   ignore TLS errors
+                                    --user-agent UA  override the User-Agent
+                                    --stealth        hide common headless automation tells
+                                    --replace        restart even if a session is already running
+                                    --extension PATH load an unpacked dir or .crx/.zip
+                                                     archive; repeat for several
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
   rodney extensions               List extensions loaded into this session
+  rodney version                  Print version
 
 Navigation:
-  rodney open <url>               Navigate to URL
+  rodney open <url> [opts]        Navigate to URL. Options:
+                                    --wait load|domcontentloaded|none (default load)
+                                    --no-wait      alias for --wait none
+                                    --timeout SEC  override the default load timeout
+                                    --expect-ok    exit non-zero on HTTP status >= 400
+                                    --then-js EXPR   after load, eval EXPR and print its result
+                                    --user-agent UA  override the User-Agent
   rodney back                     Go back in history
   rodney forward                  Go forward in history
-  rodney reload [--hard]          Reload page (--hard bypasses cache)
+  rodney reload [--hard] [--timeout SEC]   Reload page (--hard bypasses cache)
   rodney clear-cache              Clear the browser cache
 
 Page info:
   rodney url                      Print current URL
   rodney title                    Print page title
   rodney html [selector]          Print HTML (page or element)
-  rodney text <selector>          Print text content of element
+  rodney text <selector> [--timeout SEC]   Print text content of element
   rodney attr <selector> <name>   Print attribute value
   rodney pdf [file]               Save page as PDF
 
 Interaction:
-  rodney js <expression>          Evaluate JavaScript expression
+  rodney js [--timeout SEC] [--json] <expr>  Evaluate JS (--json: always valid JSON)
   rodney click <selector>         Click an element
   rodney input <selector> <text>  Type text into an input field
   rodney clear <selector>         Clear an input field
@@ -37,7 +48,7 @@ Interaction:
   rodney hover <selector>         Hover over an element
   rodney focus <selector>         Focus an element
 
-Waiting:
+Waiting (all accept --timeout SEC):
   rodney wait <selector>          Wait for element to appear
   rodney waitload                 Wait for page load
   rodney waitstable               Wait for DOM to stabilize
@@ -48,11 +59,11 @@ Screenshots:
   rodney screenshot [-w N] [-h N] [file]  Take page screenshot
   rodney screenshot-el <sel> [f]  Screenshot an element
 
-Tabs:
-  rodney pages                    List all pages/tabs
-  rodney page <index>             Switch to page by index
-  rodney newpage [url]            Open a new page/tab
-  rodney closepage [index]        Close a page/tab
+Tabs (indices are stable across calls; target ids are stable for the tab's life):
+  rodney pages                    List all pages/tabs (shows target id per tab)
+  rodney page <index|target-id>   Switch active tab by index or target id
+  rodney newpage [url]            Open a new tab; prints its target id ("target: ID")
+  rodney closepage [index|target-id]  Close a tab (defaults to the active one)
 
 Element checks:
   rodney exists <selector>        Check if element exists (exit 1 if not)
@@ -65,9 +76,11 @@ Accessibility:
   rodney ax-find [--name N] [--role R] [--json]  Find accessible nodes
   rodney ax-node <selector> [--json]        Show accessibility info for element
 
-Options:
+Options (may appear anywhere in the command):
   --local                         Use directory-scoped session (./.rodney/)
   --global                        Use global session (~/.rodney/)
+  --session NAME                  Isolate state under sessions/NAME (own Chrome)
+  --target ID                     Operate on the tab with this target id
   --version                       Print version and exit
   --help, -h, help                Show this help message
 
@@ -75,8 +88,20 @@ By default, commands auto-detect: if ./.rodney/state.json exists in the
 current directory, the local session is used; otherwise the global session.
 Use "rodney start --local" to create a directory-scoped session.
 
+Running multiple agents in parallel (no conflicts):
+  Isolation (simplest) — give each agent its own Chrome:
+    RODNEY_SESSION=agent1 rodney start      # or --session agent1
+    RODNEY_SESSION=agent1 rodney open ...    # each agent: set it once, use normally
+  Shared browser — one Chrome, each agent pins its own tab:
+    id=$(rodney newpage https://site | sed -n 's/^target: //p')
+    RODNEY_TARGET=$id rodney open https://site   # or --target $id on each command
+
 Environment:
   RODNEY_HOME                     Override data directory (default: ~/.rodney)
+  RODNEY_SESSION                  Isolate state under sessions/NAME (own Chrome)
+  RODNEY_TARGET                   Operate on the tab with this target id
+  ROD_TIMEOUT                     Default timeout in seconds (default: 30)
+  RODNEY_DEBUG                    Show full Go stack traces instead of clean errors
 
 Exit codes:
   0  Success

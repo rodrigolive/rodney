@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -51,6 +52,10 @@ func TestMain(m *testing.M) {
 	mux.HandleFunc("/download", handleDownload)
 	mux.HandleFunc("/testfile.txt", handleTestFile)
 	mux.HandleFunc("/empty", handleEmpty)
+	mux.HandleFunc("/slow", handleSlow)
+	mux.HandleFunc("/hang", handleHang)
+	mux.HandleFunc("/notfound", handleNotFound)
+	mux.HandleFunc("/ua", handleUA)
 	server := httptest.NewServer(mux)
 
 	env = &testEnv{browser: browser, server: server}
@@ -66,7 +71,7 @@ func TestMain(m *testing.M) {
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Test Page</title></head>
 <body>
@@ -86,7 +91,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func handleForm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Form Page</title></head>
 <body>
@@ -108,7 +113,7 @@ func handleForm(w http.ResponseWriter, r *http.Request) {
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Upload Page</title></head>
 <body>
@@ -125,7 +130,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Download Page</title></head>
 <body>
@@ -138,16 +143,47 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 
 func handleTestFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("Hello World"))
+	_, _ = w.Write([]byte("Hello World"))
 }
 
 func handleEmpty(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html lang="en">
 <head><title>Empty Page</title></head>
 <body></body>
 </html>`))
+}
+
+// handleSlow serves HTML whose only subresource (an image) hangs, so the DOM
+// parses (DOMContentLoaded fires) but the `load` event never arrives.
+func handleSlow(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html lang="en">
+<head><title>Slow Page</title></head>
+<body><h1>Slow</h1><img src="/hang"></body>
+</html>`))
+}
+
+// handleHang never responds, holding the request open until the client (Chrome)
+// cancels it — used to keep handleSlow's `load` event pending.
+func handleHang(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-time.After(30 * time.Second):
+	case <-r.Context().Done():
+	}
+}
+
+func handleNotFound(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte("not found"))
+}
+
+// handleUA echoes the request's User-Agent into an element, for UA-override tests.
+func handleUA(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><body><pre id="ua">%s</pre></body></html>`, r.UserAgent())
 }
 
 // --- Helper: navigate to a fixture and return the page ---
@@ -468,9 +504,9 @@ func TestFile_SetFileOnInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp file: %v", err)
 	}
-	defer os.Remove(tmp.Name())
-	tmp.Write([]byte("test content"))
-	tmp.Close()
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	_, _ = tmp.Write([]byte("test content"))
+	_ = tmp.Close()
 
 	el, err := page.Element("#file-input")
 	if err != nil {
@@ -496,14 +532,14 @@ func TestFile_MultipleFiles(t *testing.T) {
 	page := navigateTo(t, "/upload")
 
 	tmp1, _ := os.CreateTemp("", "rodney-test1-*.txt")
-	defer os.Remove(tmp1.Name())
-	tmp1.Write([]byte("file 1"))
-	tmp1.Close()
+	defer func() { _ = os.Remove(tmp1.Name()) }()
+	_, _ = tmp1.Write([]byte("file 1"))
+	_ = tmp1.Close()
 
 	tmp2, _ := os.CreateTemp("", "rodney-test2-*.txt")
-	defer os.Remove(tmp2.Name())
-	tmp2.Write([]byte("file 2"))
-	tmp2.Close()
+	defer func() { _ = os.Remove(tmp2.Name()) }()
+	_, _ = tmp2.Write([]byte("file 2"))
+	_ = tmp2.Close()
 
 	el, err := page.Element("#file-input")
 	if err != nil {
@@ -702,8 +738,8 @@ func TestResolveStateDir_AutoPrefersLocal(t *testing.T) {
 	// Create a temp directory with a .rodney/state.json to simulate local session
 	tmpDir := t.TempDir()
 	localRodney := filepath.Join(tmpDir, ".rodney")
-	os.MkdirAll(localRodney, 0755)
-	os.WriteFile(filepath.Join(localRodney, "state.json"), []byte(`{}`), 0644)
+	_ = os.MkdirAll(localRodney, 0755)
+	_ = os.WriteFile(filepath.Join(localRodney, "state.json"), []byte(`{}`), 0644)
 
 	dir := resolveStateDir(scopeAuto, tmpDir)
 	if dir != localRodney {
@@ -728,6 +764,126 @@ func TestResolveStateDir_LocalUsesWorkingDir(t *testing.T) {
 	expected := filepath.Join(tmpDir, ".rodney")
 	if dir != expected {
 		t.Errorf("local mode should use working dir: expected %q, got %q", expected, dir)
+	}
+}
+
+// =====================
+// Multi-agent: session + target addressing
+// =====================
+
+func TestExtractValueFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		flag    string
+		wantVal string
+		wantLen int
+	}{
+		{"separate", []string{"open", "--session", "a1", "url"}, "--session", "a1", 2},
+		{"equals", []string{"--session=a2", "status"}, "--session", "a2", 1},
+		{"absent", []string{"open", "url"}, "--session", "", 2},
+		{"last wins", []string{"--target", "x", "js", "--target", "y"}, "--target", "y", 1},
+		{"trailing no value", []string{"status", "--session"}, "--session", "", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			val, rest := extractValueFlag(tt.args, tt.flag)
+			if val != tt.wantVal {
+				t.Errorf("value = %q, want %q", val, tt.wantVal)
+			}
+			if len(rest) != tt.wantLen {
+				t.Errorf("rest = %v (len %d), want len %d", rest, len(rest), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestStateDir_Session(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RODNEY_HOME", dir)
+	activeSession = "agent7"
+	t.Cleanup(func() { activeSession = "" })
+	want := filepath.Join(dir, "sessions", "agent7")
+	if got := stateDir(); got != want {
+		t.Errorf("stateDir() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeSession(t *testing.T) {
+	for _, in := range []string{"../escape", "a/b", `a\b`, "../../etc"} {
+		got := sanitizeSession(in)
+		if strings.ContainsAny(got, `/\`) || strings.Contains(got, "..") {
+			t.Errorf("sanitizeSession(%q) = %q still contains a path separator or ..", in, got)
+		}
+	}
+}
+
+func TestMatchTargetID(t *testing.T) {
+	ids := []string{"AAAA1111", "AAAA2222", "BBBB3333"}
+	tests := []struct {
+		name    string
+		query   string
+		wantIdx int
+		wantErr bool
+	}{
+		{"exact", "BBBB3333", 2, false},
+		{"unique prefix", "BBBB", 2, false},
+		{"ambiguous prefix", "AAAA", -1, true},
+		{"no match", "ZZZZ", -1, true},
+		{"exact beats prefix", "AAAA1111", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx, err := matchTargetID(ids, tt.query)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if idx != tt.wantIdx {
+				t.Errorf("idx = %d, want %d", idx, tt.wantIdx)
+			}
+		})
+	}
+}
+
+func TestSuggestCommand(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"clik", "click"},
+		{"opne", "open"},
+		{"scrnshot", "screenshot"}, // distance 2 (two dropped 'e's)
+		{"sttus", "status"},
+		{"xyzzy", ""},   // too far from anything
+		{"zzzzzzz", ""}, // too far from anything
+	}
+	for _, tt := range tests {
+		if got := suggestCommand(tt.input, commandNames); got != tt.want {
+			t.Errorf("suggestCommand(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestSaveStateAtomic_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RODNEY_HOME", dir)
+	in := &State{DebugURL: "ws://x", ChromePID: 42, ActiveTarget: "TID123", ActivePage: 1}
+	if err := saveState(in); err != nil {
+		t.Fatalf("saveState: %v", err)
+	}
+	out, err := loadState()
+	if err != nil {
+		t.Fatalf("loadState: %v", err)
+	}
+	if out.ActiveTarget != "TID123" || out.ChromePID != 42 {
+		t.Errorf("round-trip mismatch: %+v", out)
+	}
+	// No leftover temp files should remain in the state dir.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file: %s", e.Name())
+		}
 	}
 }
 
@@ -923,10 +1079,10 @@ func TestAssert_ValueFormatting_MatchesJSCommand(t *testing.T) {
 		expr     string
 		expected string
 	}{
-		{`document.title`, "Test Page"},   // string unquoted
-		{`1 + 2`, "3"},                    // number
-		{`true`, "true"},                  // boolean
-		{`null`, "null"},                  // null
+		{`document.title`, "Test Page"}, // string unquoted
+		{`1 + 2`, "3"},                  // number
+		{`true`, "true"},                // boolean
+		{`null`, "null"},                // null
 		{`document.querySelectorAll("button").length`, "2"}, // number from DOM
 	}
 
@@ -1083,7 +1239,7 @@ func TestParseStartArgs_NoFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if opts.ignoreCertErrors {
+	if opts.insecure {
 		t.Error("expected insecure=false with no flags")
 	}
 	if !opts.headless {
@@ -1096,7 +1252,7 @@ func TestParseStartArgs_ShowFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if opts.ignoreCertErrors {
+	if opts.insecure {
 		t.Error("expected insecure=false")
 	}
 	if opts.headless {
@@ -1109,7 +1265,7 @@ func TestParseStartArgs_InsecureFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !opts.ignoreCertErrors {
+	if !opts.insecure {
 		t.Error("expected insecure=true when --insecure is passed")
 	}
 	if !opts.headless {
@@ -1122,7 +1278,7 @@ func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !opts.ignoreCertErrors {
+	if !opts.insecure {
 		t.Error("expected insecure=true when -k is passed")
 	}
 }
@@ -1132,11 +1288,40 @@ func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !opts.ignoreCertErrors {
+	if !opts.insecure {
 		t.Error("expected insecure=true")
 	}
 	if opts.headless {
 		t.Error("expected headless=false when --show is passed")
+	}
+}
+
+func TestParseStartArgs_UserAgentAndStealth(t *testing.T) {
+	opts, err := parseStartArgs([]string{"--stealth", "--user-agent", "Custom/1.0"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !opts.stealth {
+		t.Error("expected stealth=true")
+	}
+	if opts.userAgent != "Custom/1.0" {
+		t.Errorf("expected userAgent=Custom/1.0, got %q", opts.userAgent)
+	}
+}
+
+func TestParseStartArgs_Replace(t *testing.T) {
+	for _, flag := range []string{"--replace", "--force"} {
+		opts, err := parseStartArgs([]string{flag})
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", flag, err)
+		}
+		if !opts.replace {
+			t.Errorf("%s should set replace=true", flag)
+		}
+	}
+	opts, _ := parseStartArgs([]string{})
+	if opts.replace {
+		t.Error("replace should default to false")
 	}
 }
 
@@ -1155,7 +1340,7 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`<!DOCTYPE html>
+		_, _ = w.Write([]byte(`<!DOCTYPE html>
 <html><head><title>Secure Test</title></head>
 <body><h1>HTTPS Test Page</h1></body></html>`))
 	})
@@ -1223,4 +1408,185 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 			t.Errorf("expected page to load successfully with title 'Secure Test', got %q", title)
 		}
 	})
+}
+
+// =====================
+// flag / helper tests
+// =====================
+
+func TestParseFlagsInterspersed_FlagsAfterPositional(t *testing.T) {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	noWait := fs.Bool("no-wait", false, "")
+	wait := fs.String("wait", "load", "")
+
+	pos, err := parseFlagsInterspersed(fs, []string{"https://example.com", "--no-wait", "--wait", "none"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pos) != 1 || pos[0] != "https://example.com" {
+		t.Errorf("expected positional [https://example.com], got %v", pos)
+	}
+	if !*noWait {
+		t.Error("expected --no-wait to parse even after the positional")
+	}
+	if *wait != "none" {
+		t.Errorf("expected --wait none, got %q", *wait)
+	}
+}
+
+func TestParseFlagsInterspersed_FlagsBeforePositional(t *testing.T) {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	secs := fs.Float64("timeout", 0, "")
+
+	pos, err := parseFlagsInterspersed(fs, []string{"--timeout", "5", "https://example.com"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *secs != 5 {
+		t.Errorf("expected --timeout 5, got %v", *secs)
+	}
+	if len(pos) != 1 || pos[0] != "https://example.com" {
+		t.Errorf("expected positional [https://example.com], got %v", pos)
+	}
+}
+
+func TestParseFlagsInterspersed_UnknownFlag(t *testing.T) {
+	fs := flag.NewFlagSet("open", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if _, err := parseFlagsInterspersed(fs, []string{"https://example.com", "--bogus"}); err == nil {
+		t.Error("expected an error for an unknown flag")
+	}
+}
+
+func TestResolveTimeout(t *testing.T) {
+	if got := resolveTimeout(0); got != defaultTimeout {
+		t.Errorf("0 should resolve to defaultTimeout %v, got %v", defaultTimeout, got)
+	}
+	if got := resolveTimeout(2.5); got != 2500*time.Millisecond {
+		t.Errorf("2.5 should resolve to 2.5s, got %v", got)
+	}
+}
+
+func TestNavHint(t *testing.T) {
+	for _, msg := range []string{"read tcp: EOF", "use of closed network connection", "connection refused"} {
+		if navHint(fmt.Errorf("%s", msg)) == "" {
+			t.Errorf("error %q should produce a restart hint", msg)
+		}
+	}
+	if navHint(fmt.Errorf("element not found")) != "" {
+		t.Error("an ordinary error should produce no hint")
+	}
+}
+
+// =====================
+// wait-mode / status (integration)
+// =====================
+
+func TestWaitPageReady_NoneReturnsImmediately(t *testing.T) {
+	page := env.browser.MustPage(env.server.URL + "/slow")
+	t.Cleanup(func() { page.MustClose() })
+	if err := waitPageReady(page.Timeout(2*time.Second), "none"); err != nil {
+		t.Errorf("mode none should not wait: %v", err)
+	}
+}
+
+func TestWaitPageReady_DOMContentLoadedOnSlowPage(t *testing.T) {
+	page := env.browser.MustPage(env.server.URL + "/slow")
+	t.Cleanup(func() { page.MustClose() })
+	// DOMContentLoaded fires once the HTML is parsed, before the hanging image.
+	if err := waitPageReady(page.Timeout(5*time.Second), "domcontentloaded"); err != nil {
+		t.Errorf("domcontentloaded should resolve on a page with a hanging subresource: %v", err)
+	}
+}
+
+func TestWaitPageReady_LoadTimesOutOnSlowPage(t *testing.T) {
+	page := env.browser.MustPage(env.server.URL + "/slow")
+	t.Cleanup(func() { page.MustClose() })
+	// The `load` event never fires (image hangs), so this must return an error
+	// rather than hang or panic.
+	if err := waitPageReady(page.Timeout(2*time.Second), "load"); err == nil {
+		t.Error("load should time out while the image request hangs")
+	}
+}
+
+func TestNavigateCapturingStatus_OK(t *testing.T) {
+	page := env.browser.MustPage("")
+	t.Cleanup(func() { page.MustClose() })
+	status, err := navigateCapturingStatus(page.Timeout(10*time.Second), env.server.URL+"/empty")
+	if err != nil {
+		t.Fatalf("navigate failed: %v", err)
+	}
+	if status != 200 {
+		t.Errorf("expected HTTP 200, got %d", status)
+	}
+}
+
+func TestNavigateCapturingStatus_NotFound(t *testing.T) {
+	page := env.browser.MustPage("")
+	t.Cleanup(func() { page.MustClose() })
+	status, err := navigateCapturingStatus(page.Timeout(10*time.Second), env.server.URL+"/notfound")
+	if err != nil {
+		t.Fatalf("navigate failed: %v", err)
+	}
+	if status != 404 {
+		t.Errorf("expected HTTP 404, got %d", status)
+	}
+}
+
+func TestEvalJSExpr_Default(t *testing.T) {
+	page := navigateTo(t, "/")
+	if out, err := evalJSExpr(page, "1 + 1", false); err != nil || out != "2" {
+		t.Errorf("expected 2, got %q (err %v)", out, err)
+	}
+	if out, err := evalJSExpr(page, "'hello'", false); err != nil || out != "hello" {
+		t.Errorf("expected hello (unquoted), got %q (err %v)", out, err)
+	}
+}
+
+func TestEvalJSExpr_JSON(t *testing.T) {
+	page := navigateTo(t, "/")
+	out, err := evalJSExpr(page, "({a: 1, b: [2, 3]})", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out)
+	}
+	if parsed["a"] != float64(1) {
+		t.Errorf("expected a=1 in parsed JSON, got %v", parsed["a"])
+	}
+}
+
+func TestEvalJSExpr_JSONQuotesStrings(t *testing.T) {
+	page := navigateTo(t, "/")
+	out, err := evalJSExpr(page, "'hi'", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != `"hi"` {
+		t.Errorf("--json should emit a quoted JSON string, got %q", out)
+	}
+}
+
+func TestApplyUserAgent(t *testing.T) {
+	page := env.browser.MustPage("")
+	t.Cleanup(func() { page.MustClose() })
+	if err := applyUserAgent(page, "RodneyTest/9.9"); err != nil {
+		t.Fatalf("applyUserAgent failed: %v", err)
+	}
+	page.MustNavigate(env.server.URL + "/ua").MustWaitLoad()
+	if got := page.MustElement("#ua").MustText(); got != "RodneyTest/9.9" {
+		t.Errorf("expected the overridden UA to be echoed, got %q", got)
+	}
+}
+
+func TestApplyStealthFlags(t *testing.T) {
+	l := launcher.New()
+	applyStealthFlags(l)
+	if got := l.Get("disable-blink-features"); got != "AutomationControlled" {
+		t.Errorf("stealth should disable the AutomationControlled blink feature, got %q", got)
+	}
 }
