@@ -829,7 +829,9 @@ func evalJSExpr(page *rod.Page, expr string, asJSON bool) (string, error) {
 		}
 		return string(out), nil
 	}
-	result, err := page.Eval(fmt.Sprintf("() => { return (\n%s\n); }", expr))
+	// async so top-level await works here as it does with --json; a returned
+	// value or Promise comes back the same either way.
+	result, err := page.Eval(fmt.Sprintf("async () => { return (\n%s\n); }", expr))
 	if err != nil {
 		return "", err
 	}
@@ -893,7 +895,7 @@ func bringToFront(page *rod.Page) {
 
 // --- Commands ---
 
-const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth] [--replace] [--extension PATH]"
+const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth] [--replace] [--extension PATH] [--cache]"
 
 // startOpts holds the parsed flags for the "start" command.
 type startOpts struct {
@@ -903,6 +905,7 @@ type startOpts struct {
 	stealth    bool
 	replace    bool
 	extensions []string
+	cache      bool // keep Chrome's normal HTTP/disk cache instead of disabling it
 }
 
 // parseStartArgs parses the flags for the "start" command.
@@ -918,6 +921,7 @@ func parseStartArgs(args []string) (startOpts, error) {
 	fs.BoolVar(&o.replace, "replace", false, "")
 	fs.BoolVar(&o.replace, "force", false, "")
 	fs.Var(&extensions, "extension", "")
+	fs.BoolVar(&o.cache, "cache", false, "")
 	show := fs.Bool("show", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
@@ -948,18 +952,26 @@ func cmdStart(args []string) {
 				fmt.Printf("Chrome already running (PID %d)\n", s.ChromePID)
 				fmt.Printf("Debug URL: %s\n", s.DebugURL)
 				fmt.Println("Reusing the existing session (use 'rodney start --replace' to restart it)")
+				if ignored := ignoredOnReuse(opts); len(ignored) > 0 {
+					fmt.Fprintf(os.Stderr, "warning: ignored %s for the running browser; use 'rodney start --replace' to relaunch with them\n", strings.Join(ignored, ", "))
+				}
+				// A sidecar that died would leave 'rodney console' empty forever.
+				if s.ChromePID > 0 && !processCommandContains(s.ConsoleLoggerPID, "_console_logger") {
+					if pid := startConsoleLogger(s.DebugURL); pid > 0 {
+						s.ConsoleLoggerPID = pid
+						if err := saveState(s); err == nil {
+							fmt.Println("Restarted console capture")
+						}
+					}
+				}
 				return
 			}
 			b.MustClose()
 			removeState()
 		}
 		// Either we are replacing, or the old browser is dead; clean up any
-		// stale auth-proxy helper before launching a new one.
-		if s.ProxyPID > 0 {
-			if proc, perr := os.FindProcess(s.ProxyPID); perr == nil {
-				_ = proc.Signal(syscall.SIGTERM)
-			}
-		}
+		// helpers still running for it before launching a new one.
+		stopHelpers(s)
 	}
 
 	dataDir := filepath.Join(stateDir(), "chrome-data")
@@ -972,17 +984,20 @@ func cmdStart(args []string) {
 	l := launcher.New().
 		Set("no-sandbox").
 		Set("disable-gpu").
-		// Effectively disable the disk and media caches at the Chrome process
-		// level. Browser-UI reloads, DevTools reloads, and scripted reloads all
-		// honor this — unlike CDP's Network.setCacheDisabled, which is target-
-		// scoped and can desync from the visible DevTools checkbox state. This
-		// matches the developer expectation that rodney sessions never serve
-		// stale assets.
-		Set("disk-cache-size", "1").
-		Set("media-cache-size", "1").
 		Leakless(false). // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
+
+	// Unless --cache, effectively disable the disk and media caches at the
+	// Chrome process level. Browser-UI reloads, DevTools reloads, and scripted
+	// reloads all honor this — unlike CDP's Network.setCacheDisabled, which is
+	// target-scoped and can desync from the visible DevTools checkbox state.
+	// This matches the developer expectation that rodney sessions never serve
+	// stale assets. It is fixed for the browser's lifetime: 'no-cache off'
+	// can't bring the disk cache back, only 'start --replace --cache' can.
+	if !opts.cache {
+		l = l.Set("disk-cache-size", "1").Set("media-cache-size", "1")
+	}
 
 	if singleProcessSupported() {
 		l = l.Set("single-process") // Required for screenshots in gVisor/container environments
@@ -1068,17 +1083,7 @@ func cmdStart(args []string) {
 	}
 
 	// Launch console-capture sidecar so 'rodney console' can replay output.
-	// Best-effort: if it fails to start, Chrome itself is still usable.
-	var consoleLoggerPID int
-	{
-		exe, _ := os.Executable()
-		ccmd := exec.Command(exe, "_console_logger", debugURL, consoleLogPath())
-		setSysProcAttr(ccmd)
-		if err := ccmd.Start(); err == nil {
-			consoleLoggerPID = ccmd.Process.Pid
-			ccmd.Process.Release()
-		}
-	}
+	consoleLoggerPID := startConsoleLogger(debugURL)
 
 	state := &State{
 		DebugURL:         debugURL,
@@ -1091,12 +1096,11 @@ func cmdStart(args []string) {
 		ConsoleLoggerPID: consoleLoggerPID,
 		Visible:          !headless,
 		UserAgent:        sessionUA,
-		// HTTP cache off by default. Toggle with `rodney no-cache off` if you
-		// need cache-on for a session (rare — usually only when testing cache
-		// behavior itself). The per-command re-apply (line ~427) plus the
-		// console-logger's periodic per-page enforcement together make this
-		// hold across browser-UI reloads, not just rodney-driven navigation.
-		NoCacheDisabled: true,
+		// HTTP cache off by default (--cache keeps it). Toggle with
+		// `rodney no-cache on|off`. The per-command re-apply in
+		// withPageTimeout plus the console-logger's periodic per-page
+		// enforcement make this hold across browser-UI reloads too.
+		NoCacheDisabled: !opts.cache,
 	}
 
 	if err := saveState(state); err != nil {
@@ -1200,10 +1204,10 @@ func cmdStop(args []string) {
 	}
 	browser, err := connectBrowser(s)
 	if err != nil {
-		// Try to kill by PID only if we launched the browser
-		if s.ChromePID > 0 {
-			proc, err := os.FindProcess(s.ChromePID)
-			if err == nil {
+		// Try to kill by PID only if we launched the browser, and only if that
+		// PID is still our Chrome (its profile dir is on the command line).
+		if s.ChromePID > 0 && s.DataDir != "" && processCommandContains(s.ChromePID, "--user-data-dir="+s.DataDir) {
+			if proc, err := os.FindProcess(s.ChromePID); err == nil {
 				_ = proc.Signal(syscall.SIGTERM)
 			}
 		}
@@ -1212,22 +1216,66 @@ func cmdStop(args []string) {
 		browser.MustClose()
 	}
 	// If ChromePID==0 we connected to an external browser; just clear state without closing it
-	// Also kill the proxy helper if running
-	if s.ProxyPID > 0 {
+	stopHelpers(s)
+	removeState()
+	fmt.Println("Chrome stopped")
+}
+
+// stopHelpers ends the auth proxy and console sidecar recorded in s, but only
+// if each PID is still running that helper: a recycled PID must never be hit.
+func stopHelpers(s *State) {
+	if processCommandContains(s.ProxyPID, "_proxy") {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
 			_ = proc.Signal(syscall.SIGTERM)
 		}
 	}
-	if s.ConsoleLoggerPID > 0 {
+	if processCommandContains(s.ConsoleLoggerPID, "_console_logger") {
 		if proc, err := os.FindProcess(s.ConsoleLoggerPID); err == nil {
-			// Use Kill rather than SIGTERM so this works cross-platform
-			// (SIGTERM is not delivered to processes on Windows). The
-			// sidecar has no graceful-shutdown logic worth waiting for.
+			// Kill rather than SIGTERM so this works cross-platform (SIGTERM is
+			// not delivered on Windows); the sidecar has nothing to flush.
 			_ = proc.Kill()
 		}
 	}
-	removeState()
-	fmt.Println("Chrome stopped")
+}
+
+// startConsoleLogger launches the console-capture sidecar for the browser at
+// debugURL and returns its PID, or 0 if it could not start. Best-effort:
+// Chrome is usable without it, 'rodney console' just stays empty.
+func startConsoleLogger(debugURL string) int {
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "_console_logger", debugURL, consoleLogPath())
+	setSysProcAttr(cmd)
+	if err := cmd.Start(); err != nil {
+		return 0
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Process.Release()
+	return pid
+}
+
+// ignoredOnReuse lists the launch options in opts that can't apply to a browser
+// that is already running, so 'start' can say it ignored them.
+func ignoredOnReuse(opts startOpts) []string {
+	var ignored []string
+	if !opts.headless {
+		ignored = append(ignored, "--show")
+	}
+	if opts.insecure {
+		ignored = append(ignored, "--insecure")
+	}
+	if opts.userAgent != "" {
+		ignored = append(ignored, "--user-agent")
+	}
+	if opts.stealth {
+		ignored = append(ignored, "--stealth")
+	}
+	if len(opts.extensions) > 0 {
+		ignored = append(ignored, "--extension")
+	}
+	if opts.cache {
+		ignored = append(ignored, "--cache")
+	}
+	return ignored
 }
 
 func cmdStatus(args []string) {
@@ -1471,7 +1519,7 @@ func cmdNoCache(args []string) {
 	if on {
 		fmt.Println("HTTP cache disabled (re-applied on every command until 'no-cache off')")
 	} else {
-		fmt.Println("HTTP cache re-enabled")
+		fmt.Println("HTTP cache re-enabled (the disk cache stays off unless the browser was started with --cache)")
 	}
 }
 
@@ -2983,6 +3031,7 @@ func cmdInternalConsoleLogger(args []string) {
 	// browser-UI reloads (F5) and DevTools reloads bypass cache, not just
 	// rodney-driven navigation. The per-command re-apply (cmdStart's
 	// connect-per-command path) only covers rodney-initiated work.
+	cacheWasDisabled := false
 	applyPerPageHooks := func() {
 		// Re-read state on every tick so `rodney no-cache off` takes effect
 		// without bouncing the sidecar.
@@ -2993,12 +3042,20 @@ func cmdInternalConsoleLogger(args []string) {
 		if pages, err := browser.Pages(); err == nil {
 			for _, p := range pages {
 				_ = proto.RuntimeEnable{}.Call(p)
-				if noCache {
+				switch {
+				case noCache:
 					_ = proto.NetworkEnable{}.Call(p)
 					_ = proto.NetworkSetCacheDisabled{CacheDisabled: true}.Call(p)
+				case cacheWasDisabled:
+					// This long-lived session is what kept the cache off, so
+					// 'no-cache off' has to be undone here too; stop streaming
+					// Network events we no longer need while at it.
+					_ = proto.NetworkSetCacheDisabled{CacheDisabled: false}.Call(p)
+					_ = proto.NetworkDisable{}.Call(p)
 				}
 			}
 		}
+		cacheWasDisabled = noCache
 	}
 	applyPerPageHooks()
 	// Cheap periodic re-apply handles newly-opened tabs and state changes.
@@ -3082,7 +3139,9 @@ func cmdConsole(args []string) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return // no entries yet — silent
+			// stdout stays empty for scripts; tell humans and agents why.
+			fmt.Fprintln(os.Stderr, "no console output captured yet (sessions from 'rodney connect' have no capture; for a started browser, 'rodney start' restarts a dead capture process)")
+			return
 		}
 		fatal("failed to open console log: %v", err)
 	}

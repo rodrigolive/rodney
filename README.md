@@ -60,8 +60,8 @@ No malicious code turned up. Two branches had real safety problems; one was fixe
 
 ### Behaviour changes from upstream
 
-- The HTTP cache is off by default. Use `rodney no-cache off` for a session that needs it.
-- `rodney start` reuses a browser that's already running. Use `--replace` to restart it.
+- The HTTP cache is off by default. Start with `rodney start --cache` for a normally caching browser. `rodney no-cache off` turns HTTP caching back on for a running session, but the disk cache stays off.
+- `rodney start` reuses a browser that's already running, and warns about any launch options it had to ignore. Use `--replace` to restart it.
 - On macOS, Chrome no longer runs with `--single-process`.
 
 ### Install

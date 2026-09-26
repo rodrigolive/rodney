@@ -9,6 +9,9 @@ Browser lifecycle:
                                     --replace        restart even if a session is already running
                                     --extension PATH load an unpacked dir or .crx/.zip
                                                      archive; repeat for several
+                                    --cache          keep the HTTP/disk cache (off by default)
+                                  On a running session, options are ignored (with a
+                                  warning) unless --replace is given.
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
@@ -28,7 +31,8 @@ Navigation:
   rodney reload [--hard] [--timeout SEC]   Reload page (--hard bypasses cache)
   rodney clear-cache              Clear the browser cache
   rodney no-cache <on|off>        Disable/enable HTTP cache for the session
-                                  (persists across reloads; set once after start)
+                                  (persists across reloads; the disk cache only
+                                  comes back with 'start --replace --cache')
 
 Page info:
   rodney url                      Print current URL

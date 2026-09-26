@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1664,4 +1665,49 @@ func TestResolvePageIndex(t *testing.T) {
 			t.Error("expected ambiguous-match error")
 		}
 	})
+}
+
+// --- start reuse / helper process guards (pure logic, no browser) ---
+
+func TestParseStartArgs_Cache(t *testing.T) {
+	opts, err := parseStartArgs([]string{"--cache"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !opts.cache {
+		t.Error("--cache should set opts.cache")
+	}
+	if opts, _ := parseStartArgs(nil); opts.cache {
+		t.Error("cache should be off by default")
+	}
+}
+
+func TestIgnoredOnReuse(t *testing.T) {
+	if got := ignoredOnReuse(startOpts{headless: true}); len(got) != 0 {
+		t.Errorf("plain start should ignore nothing, got %v", got)
+	}
+	if got := ignoredOnReuse(startOpts{headless: true, replace: true}); len(got) != 0 {
+		t.Errorf("--replace is not a launch option to warn about, got %v", got)
+	}
+	got := ignoredOnReuse(startOpts{userAgent: "X", stealth: true, extensions: []string{"/e"}, cache: true, insecure: true})
+	want := "--show,--insecure,--user-agent,--stealth,--extension,--cache"
+	if strings.Join(got, ",") != want {
+		t.Errorf("got %v, want %s", got, want)
+	}
+}
+
+func TestProcessCommandContains(t *testing.T) {
+	if processCommandContains(0, "x") || processCommandContains(-1, "x") || processCommandContains(1, "x") {
+		t.Error("pids <= 1 must never match")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("no command-line check on Windows")
+	}
+	exe := filepath.Base(os.Args[0])
+	if !processCommandContains(os.Getpid(), exe) {
+		t.Errorf("own process should contain %q", exe)
+	}
+	if processCommandContains(os.Getpid(), "_console_logger") {
+		t.Error("own process is not a console sidecar")
+	}
 }

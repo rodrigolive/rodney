@@ -22,7 +22,7 @@ Rodney is driven by many agents at once. Preserve these invariants when touching
 - **`saveState` is atomic** (temp + rename). Keep it that way.
 - **`start` is non-destructive**: it reuses a live session and only relaunches under `--replace`. Never `Close()` the browser on a reuse path; that kills Chrome.
 - **Device emulation**: `connectBrowser` skips go-rod's default device for visible sessions (`--show`, `connect`). Headless sessions keep the 1280x800 device, with the UA pinned at start in `State.UserAgent`. Changing this changes responsive layouts for every headless caller.
-- **Helper processes** (`_proxy`, `_console_logger`) re-exec the rodney binary and receive everything they need as arguments. The console sidecar pins its state dir to its log's directory, and `console.log` is 0600.
+- **Helper processes** (`_proxy`, `_console_logger`) re-exec the rodney binary and receive everything they need as arguments. The console sidecar pins its state dir to its log's directory, and `console.log` is 0600. Never signal a PID read from state.json without `processCommandContains` confirming it's still that helper (or Chrome with this session's `--user-data-dir`); go through `stopHelpers`.
 
 ## Layout & gotchas
 
