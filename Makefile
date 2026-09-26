@@ -44,7 +44,7 @@ test: ## Full Go test suite (boots one headless Chrome)
 
 test-sh: build ## Bash integration harness (./test.sh) in a throwaway RODNEY_HOME
 	go build -o /tmp/testserver ./tests/testserver
-	RODNEY_HOME=$$(mktemp -d) ./test.sh
+	RODNEY_HOME=$$(mktemp -d) bash ./test.sh
 
 run: ## Run from source: make run ARGS='open https://example.com'
 	go run . $(ARGS)
