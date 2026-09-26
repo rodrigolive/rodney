@@ -2950,9 +2950,10 @@ func cmdInternalConsoleLogger(args []string) {
 	logPath := args[1]
 
 	// The sidecar is spawned without --local/--global/--session (and may
-	// inherit RODNEY_SESSION), so pin its state lookups to the session that
-	// launched it: the log sits in that session's state dir.
-	activeStateDir = filepath.Dir(logPath)
+	// inherit RODNEY_SESSION or RODNEY_HOME), so pin its state lookups to the
+	// session that launched it: the log sits in that session's state dir.
+	// RODNEY_HOME is set rather than activeStateDir because it outranks it.
+	_ = os.Setenv("RODNEY_HOME", filepath.Dir(logPath))
 	activeSession = ""
 
 	// Pages log tokens and personal data often enough; keep the log private.

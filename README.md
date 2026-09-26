@@ -77,7 +77,11 @@ Requires Go 1.25+. Chrome/Chromium is downloaded automatically on first `start`,
 
 ### Status
 
-The merged tree builds, passes `go vet` and gofmt, and its tests compile. The full browser-backed test suite (`make test`) has not been run against the merged result yet.
+Upstream's `test.yml` only builds the binary and checks `--version`. This fork adds `ci.yml`, which on every push runs:
+- `go vet`, gofmt and a `go mod tidy` check;
+- the Go test suite and `test.sh`, both against rod's pinned Chromium, on Linux and macOS.
+
+Check the Actions tab for the current result. `test.sh` now has its fixture server in `tests/testserver`; upstream relied on a `/tmp/testserver` binary that was never committed. `make test-sh` runs it in a throwaway `RODNEY_HOME`, so it never touches your own rodney session.
 
 ### Keeping up with upstream
 

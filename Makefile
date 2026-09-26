@@ -42,8 +42,9 @@ vet: ## go vet, gofmt check, and compile the tests without running them
 test: ## Full Go test suite (boots one headless Chrome)
 	go test ./... -count=1
 
-test-sh: build ## Bash integration harness against the built ./rodney
-	./test.sh
+test-sh: build ## Bash integration harness (./test.sh) in a throwaway RODNEY_HOME
+	go build -o /tmp/testserver ./tests/testserver
+	RODNEY_HOME=$$(mktemp -d) ./test.sh
 
 run: ## Run from source: make run ARGS='open https://example.com'
 	go run . $(ARGS)

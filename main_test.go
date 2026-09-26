@@ -33,9 +33,15 @@ func TestMain(m *testing.M) {
 	l := launcher.New().
 		Set("no-sandbox").
 		Set("disable-gpu").
-		Set("single-process").
 		Headless(true).
 		Leakless(false)
+
+	// Same platform flags as 'rodney start', so macOS runs test the browser
+	// users actually get (no --single-process, no field-trial experiments).
+	if singleProcessSupported() {
+		l = l.Set("single-process")
+	}
+	l = configureExperiments(l)
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)

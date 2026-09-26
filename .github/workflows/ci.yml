@@ -1,0 +1,60 @@
+name: CI
+
+# Runs the real test suites. test.yml (upstream) only builds and checks
+# --version on three OSes; this runs the Go tests and test.sh against a real
+# browser on Linux and macOS (the fork's macOS crash fixes need a Mac runner).
+# Chromium is the revision rod pins and downloads, i.e. what users get.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vet:
+    name: vet + gofmt + tidy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make vet
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  test:
+    name: ${{ matrix.suite }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        suite: [go-test, test-sh]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Cache rod's Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/rod/browser
+          key: rod-chromium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+      - name: go test
+        if: matrix.suite == 'go-test'
+        run: go test ./... -count=1 -timeout 20m
+      - name: test.sh
+        if: matrix.suite == 'test-sh'
+        run: make test-sh

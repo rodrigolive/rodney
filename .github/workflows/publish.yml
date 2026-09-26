@@ -32,7 +32,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.24.x'
+          go-version-file: go.mod
       - name: Build binaries
         env:
           GOOS: ${{ matrix.goos }}
@@ -100,13 +100,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-wheels:
+    # PyPI package 'rodney' belongs to simonw; forks only attach binaries.
+    if: github.repository == 'simonw/rodney'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
     - name: Set up Go
       uses: actions/setup-go@v6
       with:
-        go-version: '1.24.x'
+        go-version-file: go.mod
     - name: Install uv
       uses: astral-sh/setup-uv@v6
     - name: Build wheels
