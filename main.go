@@ -601,8 +601,8 @@ func main() {
 // commandNames lists every dispatchable command, used to suggest a correction
 // when an agent mistypes one.
 var commandNames = []string{
-	"start", "connect", "stop", "status", "version",
-	"open", "back", "forward", "reload", "clear-cache",
+	"start", "connect", "stop", "status", "version", "extensions",
+	"open", "back", "forward", "reload", "clear-cache", "no-cache",
 	"url", "title", "html", "text", "attr", "pdf",
 	"js", "click", "input", "clear", "select", "submit", "hover", "file", "download", "focus",
 	"wait", "waitload", "waitstable", "waitidle", "sleep",
@@ -610,6 +610,7 @@ var commandNames = []string{
 	"pages", "page", "newpage", "closepage",
 	"exists", "count", "visible", "assert",
 	"ax-tree", "ax-find", "ax-node",
+	"console",
 	"help",
 }
 

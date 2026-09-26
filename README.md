@@ -1,5 +1,25 @@
 # Rodney: Chrome automation from the command line
 
+> **This is [rodrigolive](https://github.com/rodrigolive)'s fork of [simonw/rodney](https://github.com/simonw/rodney).**
+> Upstream has been quiet since 2026-03-12, with its open PRs unmerged. This fork collects the fork work that matters for agents driving rodney on macOS. Every branch was read line by line before merging and pinned to the SHA that was reviewed.
+>
+> | Merged | Pinned | What it brings |
+> |---|---|---|
+> | [goeric PR #54](https://github.com/simonw/rodney/pull/54) | `663fc04` | Fixes two Chromium browser-process crashes: no `--single-process` on macOS, and no field-trial experiments such as HistoryEmbeddings |
+> | [goeric PR #55](https://github.com/simonw/rodney/pull/55) | `62b5bbf` | Raises the target tab before screenshots, so `page N` + `screenshot` no longer times out |
+> | [goeric PR #52](https://github.com/simonw/rodney/pull/52) | `920b808` | `start --extension PATH` (dir/.crx/.zip) and `rodney extensions` |
+> | [ejolly/main](https://github.com/ejolly/rodney) | `e715d1a` | `--session`/`--target` for parallel agents, stable tab ids, atomic state, non-destructive `start`, `open --wait/--timeout/--expect-ok/--then-js`, `js --json`, `--user-agent`/`--stealth`, clean errors instead of stack traces |
+> | [chrisperfer/main](https://github.com/chrisperfer/rodney) | `8b0154c` | `rodney console`, `js -` / `js --file`, `--page <idx\|substring>`, HTTP cache off by default (`no-cache on\|off`), `--show` maximized |
+>
+> Fork-only fixes on top:
+> - Headless sessions keep a 1280x800 viewport, with the browser's real UA minus `HeadlessChrome`. Visible sessions render at the real window size.
+> - `--page` beats `--target`.
+> - The console sidecar stays in its own session, and `console.log` is 0600.
+> - `js --json` awaits promises.
+> - The `just`/golangci tooling was replaced by a `Makefile`; run `make` for usage.
+>
+> Considered but not merged: zbkilla's `rodney network` (anonymous commit identity, plus unsafe PID handling and file writes driven by CDP data) and the large bundle forks (jamalex, Battle-Creek-LLC, devskale).
+
 [![PyPI](https://img.shields.io/pypi/v/rodney.svg)](https://pypi.org/project/rodney/)
 [![Changelog](https://img.shields.io/github/v/release/simonw/rodney?include_prereleases&label=changelog)](https://github.com/simonw/rodney/releases)
 [![Tests](https://github.com/simonw/rodney/actions/workflows/test.yml/badge.svg)](https://github.com/simonw/rodney/actions/workflows/test.yml)

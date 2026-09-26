@@ -3,3 +3,4 @@ rodney-*
 dist
 .DS_Store
 .claude/
+.agent/
