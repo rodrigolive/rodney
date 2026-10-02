@@ -208,7 +208,7 @@ func TestWriteProfilePrefs(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(`{"profile":{"name":"x"},"webrtc":{"multiple_routes_enabled":false}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"profile":{"name":"x"},"webrtc":{"multiple_routes_enabled":false},"intl":{"selected_languages":"en-US,en"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -223,8 +223,8 @@ func TestWriteProfilePrefs(t *testing.T) {
 	if webrtc["ip_handling_policy"] != "disable_non_proxied_udp" || webrtc["multiple_routes_enabled"] != false {
 		t.Errorf("webrtc = %v", webrtc)
 	}
-	if doc["intl"].(map[string]any)["accept_languages"] != "en-US,es" {
-		t.Errorf("intl = %v", doc["intl"])
+	if intl := doc["intl"].(map[string]any); intl["accept_languages"] != "en-US,es" || intl["selected_languages"] != "en-US,es" {
+		t.Errorf("intl = %v (Chrome rebuilds accept_languages from selected_languages: both must change)", intl)
 	}
 
 	// Not proxied any more: the policy goes, the rest stays.
@@ -286,6 +286,14 @@ func TestLaunchIdentity_WhatPagesSee(t *testing.T) {
 	ua, li := configureIdentity(l, opts, bin, runtime.GOOS)
 	if !li || ua == "" {
 		t.Fatalf("expected a launch identity, got (%q, %v)", ua, li)
+	}
+	// A profile that has been used: Chrome rebuilds accept_languages from
+	// selected_languages, so the change must win over an existing list.
+	if err := os.MkdirAll(filepath.Join(dir, "Default"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Default", "Preferences"), []byte(`{"intl":{"accept_languages":"en-US,en","selected_languages":"en-US,en"}}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if err := writeProfilePrefs(dir, identityPrefs(true, opts.lang)); err != nil {
 		t.Fatal(err)

@@ -206,6 +206,9 @@ type profilePrefs map[string]any
 // langs sets the languages pages see (navigator.languages, Accept-Language).
 // Headless Chrome ignores --lang and --accept-lang for both; the preference is
 // what a user changes in settings, and it works headless and headed alike.
+// Current Chrome keeps the list in intl.selected_languages and rebuilds
+// accept_languages from it at startup, so a profile that already has one
+// would undo an edit to accept_languages alone: both are set.
 func identityPrefs(proxied bool, langs string) profilePrefs {
 	p := profilePrefs{"webrtc.ip_handling_policy": nil}
 	if proxied {
@@ -213,6 +216,7 @@ func identityPrefs(proxied bool, langs string) profilePrefs {
 	}
 	if langs != "" {
 		p["intl.accept_languages"] = langs
+		p["intl.selected_languages"] = langs
 	}
 	return p
 }
