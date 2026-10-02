@@ -1,6 +1,6 @@
 # Rodney: Chrome automation from the command line
 
-> **This is [rodrigolive](https://github.com/rodrigolive)'s fork of [simonw/rodney](https://github.com/simonw/rodney).** It merges reviewed fixes and features from other forks that upstream hasn't taken yet. See [About this fork](#about-this-fork) for what changed, where it came from and how it was checked. `pip install rodney` / `uvx rodney` still install upstream; to get this version, download a [`rod-v*` release](https://github.com/rodrigolive/rodney/releases) binary or build from source.
+> **This is [rodrigolive](https://github.com/rodrigolive)'s fork of [simonw/rodney](https://github.com/simonw/rodney).** It merges reviewed fixes and features from other forks that upstream hasn't taken yet. See [About this fork](#about-this-fork) for what changed, where it came from and how it was checked. `pip install rodney` / `uvx rodney` still install upstream; build from source to get this version.
 
 [![PyPI](https://img.shields.io/pypi/v/rodney.svg)](https://pypi.org/project/rodney/)
 [![Changelog](https://img.shields.io/github/v/release/simonw/rodney?include_prereleases&label=changelog)](https://github.com/simonw/rodney/releases)
@@ -66,15 +66,6 @@ No malicious code turned up. Two branches had real safety problems; one was fixe
 
 ### Install
 
-Prebuilt binaries for macOS and Linux (amd64 and arm64) are attached to each [release](https://github.com/rodrigolive/rodney/releases). Fork releases are tagged `rod-vX.Y.Z`, so they never collide with upstream's `vX.Y.Z` tags, and `rodney --version` prints the tag.
-
-```bash
-gh release download -R rodrigolive/rodney --pattern 'rodney-linux-amd64.tar.gz'   # or darwin-arm64, ...
-tar xzf rodney-linux-amd64.tar.gz && install -m 0755 rodney ~/util/rodney
-```
-
-Or build from source (Go 1.25+):
-
 ```bash
 git clone https://github.com/rodrigolive/rodney
 cd rodney
@@ -82,7 +73,7 @@ make build        # ./rodney, version-stamped from git
 make install      # copies it to INSTALL_DIR (default ~/util)
 ```
 
-Chrome/Chromium is downloaded automatically on first `start`, or set `ROD_CHROME_BIN`.
+Requires Go 1.25+. Chrome/Chromium is downloaded automatically on first `start`, or set `ROD_CHROME_BIN`.
 
 ### Status
 
