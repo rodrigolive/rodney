@@ -34,8 +34,10 @@ import (
 // emulation used to give, and outerHeight > innerHeight as in a real window.
 const headlessWindow = "1280,887"
 
-// headlessScreen is the screen headless Chrome reports on Linux, where it
-// otherwise defaults to 800x600, smaller than its own window.
+// headlessScreen is the screen a headless session reports. Headless Chrome
+// otherwise defaults to 800x600, smaller than its own window: on Linux with
+// any build, and on macOS with current Chrome (rod's Chromium 128 on macOS
+// ignores the switch and reports the real display, which is fine too).
 const headlessScreen = "{1920x1080}"
 
 var chromeVersionRE = regexp.MustCompile(`(\d+)\.\d+\.\d+\.\d+`)
@@ -111,9 +113,7 @@ func configureIdentity(l *launcher.Launcher, opts startOpts, bin, goos string) (
 			// Screenshots stay 1280x800 pixels on HiDPI Macs, as with the
 			// emulated device this replaces.
 			l.Set("force-device-scale-factor", "1")
-			if screen := headlessScreenInfo(goos); screen != "" {
-				l.Set("screen-info", screen)
-			}
+			l.Set("screen-info", headlessScreen)
 		}
 	}
 	if opts.lang != "" {
@@ -324,14 +324,4 @@ func launchWindow(window string, headless bool) (string, error) {
 		return "", fmt.Errorf("invalid --window %q (want WIDTHxHEIGHT, e.g. 1920x1080)", window)
 	}
 	return fmt.Sprintf("%d,%d", wi, hi), nil
-}
-
-// headlessScreenInfo returns the --screen-info value for a headless launch on
-// goos: Linux reports an 800x600 screen otherwise; macOS and Windows report
-// the real display.
-func headlessScreenInfo(goos string) string {
-	if goos == "linux" {
-		return headlessScreen
-	}
-	return ""
 }

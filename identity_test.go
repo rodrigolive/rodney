@@ -70,6 +70,28 @@ func TestConfigureIdentity_FallsBackWithoutVersion(t *testing.T) {
 	}
 }
 
+func TestConfigureIdentity_HeadlessScreen(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "chrome")
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a shell script stand-in for the browser")
+	}
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho 'Google Chrome 154.0.8037.97'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, goos := range []string{"linux", "darwin"} {
+		l := launcher.New()
+		if _, li := configureIdentity(l, startOpts{headless: true}, fake, goos); !li {
+			t.Fatalf("%s: expected a launch identity", goos)
+		}
+		// Current headless Chrome reports 800x600 on macOS too, under a
+		// 1280x887 window.
+		if got := l.Get("screen-info"); got != headlessScreen {
+			t.Errorf("%s: screen-info = %q, want %q", goos, got, headlessScreen)
+		}
+	}
+}
+
 func TestConfigureIdentity_Headed(t *testing.T) {
 	l := launcher.New()
 	ua, li := configureIdentity(l, startOpts{window: "1920x1080"}, "unused", "linux")

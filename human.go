@@ -261,19 +261,25 @@ func humanScrollIntoView(page *rod.Page, el *rod.Element) error {
 		if err != nil {
 			return el.ScrollIntoView()
 		}
-		_, h, err := viewport(page)
+		w, h, err := viewport(page)
 		if err != nil {
 			return err
 		}
-		if box.Y >= 0 && box.Y+box.Height <= h {
+		var dx, dy float64
+		if box.Y < 0 || box.Y+box.Height > h {
+			dy = box.Y + box.Height/2 - h/2
+		}
+		if box.X < 0 || box.X+box.Width > w {
+			dx = box.X + box.Width/2 - w/2
+		}
+		if dx == 0 && dy == 0 {
 			return nil
 		}
-		before := box.Y
-		if err := humanWheel(page, box.Y+box.Height/2-h/2); err != nil {
+		if err := humanWheelXY(page, dx, dy); err != nil {
 			return err
 		}
 		time.Sleep(250 * time.Millisecond) // let smooth scrolling settle
-		if box, err := elementBox(el); err != nil || math.Abs(box.Y-before) < 1 {
+		if after, err := elementBox(el); err != nil || math.Hypot(after.X-box.X, after.Y-box.Y) < 1 {
 			return el.ScrollIntoView()
 		}
 	}
@@ -283,19 +289,35 @@ func humanScrollIntoView(page *rod.Page, el *rod.Element) error {
 // humanWheel scrolls by dy CSS pixels in wheel notches of about 100px (what a
 // mouse wheel sends per detent), a short pause between notches.
 func humanWheel(page *rod.Page, dy float64) error {
+	return humanWheelXY(page, 0, dy)
+}
+
+// humanWheelXY scrolls by dy, then dx (a horizontal wheel or Shift+wheel), in
+// notches at the pointer.
+func humanWheelXY(page *rod.Page, dx, dy float64) error {
 	at := pointerStart(page)
-	sign := 1.0
-	if dy < 0 {
-		sign, dy = -1, -dy
-	}
-	for dy > 0 {
-		notch := math.Min(dy, 100+float64(rand.IntN(21)-10))
-		ev := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseWheel, X: at.X, Y: at.Y, DeltaY: sign * notch}
-		if err := dispatchMouse(page, ev); err != nil {
-			return err
+	for _, axis := range []struct {
+		d        float64
+		vertical bool
+	}{{dy, true}, {dx, false}} {
+		d, sign := axis.d, 1.0
+		if d < 0 {
+			sign, d = -1, -d
 		}
-		dy -= notch
-		sleepRange(35, 110)
+		for d > 0 {
+			notch := math.Min(d, 100+float64(rand.IntN(21)-10))
+			ev := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseWheel, X: at.X, Y: at.Y}
+			if axis.vertical {
+				ev.DeltaY = sign * notch
+			} else {
+				ev.DeltaX = sign * notch
+			}
+			if err := dispatchMouse(page, ev); err != nil {
+				return err
+			}
+			d -= notch
+			sleepRange(35, 110)
+		}
 	}
 	savePointer(page, at)
 	return nil
@@ -315,6 +337,27 @@ func humanClick(page *rod.Page, el *rod.Element) error {
 	}
 	sleepRange(45, 130)
 	return dispatchMouse(page, proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseReleased, X: at.X, Y: at.Y, Button: left, Buttons: gson.Int(0), ClickCount: 1})
+}
+
+// humanFocusField clicks into a form field as a person would. A field nothing
+// can click (an overlay over all of it) still gets focus, so typing stays key
+// by key, unless a modal that traps focus (a consent dialog) takes it back:
+// then the keys would land in the dialog, so it refuses with the click's
+// reason.
+func humanFocusField(page *rod.Page, el *rod.Element) error {
+	clickErr := humanClick(page, el)
+	if clickErr == nil {
+		return nil
+	}
+	// Checked again a moment later: some traps pull focus back from a timer.
+	focused, err := el.Eval(`function () {
+		this.focus()
+		return new Promise(r => setTimeout(() => r(document.activeElement === this), 60))
+	}`)
+	if err != nil || !focused.Value.Bool() {
+		return clickErr
+	}
+	return nil
 }
 
 // humanPointAt scrolls el into view and moves the pointer to a random point on
@@ -508,7 +551,7 @@ func parseScrollArgs(args []string) (dy float64, selector string, err error) {
 	case "down", "up":
 		px := 600.0
 		if len(args) == 2 {
-			if px, err = strconv.ParseFloat(args[1], 64); err != nil || px <= 0 {
+			if px, err = strconv.ParseFloat(args[1], 64); err != nil || px <= 0 || math.IsInf(px, 0) || math.IsNaN(px) {
 				return 0, "", fmt.Errorf("invalid pixel amount %q\n%s", args[1], scrollUsage)
 			}
 		}

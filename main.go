@@ -1274,6 +1274,9 @@ func cmdStop(args []string) {
 	}
 	// If ChromePID==0 we connected to an external browser; just clear state without closing it
 	stopHelpers(s)
+	// Chrome writes its Preferences on the way out, and a 'start' right after
+	// edits them; the PID to wait on goes with the state, so wait here.
+	waitChromeExit(s)
 	removeState()
 	fmt.Println("Chrome stopped")
 }
@@ -1797,18 +1800,11 @@ func cmdInput(args []string) {
 	}
 	text := strings.Join(args[1:], " ")
 	if humanEnabled(s) {
-		// Click into the field, select what's there, and type over it. A
-		// field nothing can click (an overlay over all of it) still gets
-		// focus, and the typing stays key by key, unless a modal that traps
-		// focus (a consent dialog) takes it back: then the keys would land in
-		// the dialog, so it refuses with the click's reason.
+		// Click into the field, select what's there, and type over it.
 		page = page.CancelTimeout().Timeout(humanTimeout(text))
 		el = el.Context(page.GetContext())
-		if clickErr := humanClick(page, el); clickErr != nil {
-			focused, err := el.Eval(`function () { this.focus(); return document.activeElement === this }`)
-			if err != nil || !focused.Value.Bool() {
-				fatal("input failed: %v", clickErr)
-			}
+		if err := humanFocusField(page, el); err != nil {
+			fatal("input failed: %v", err)
 		}
 		if err := el.SelectAllText(); err != nil {
 			fatal("input failed: %v", err)
@@ -1832,7 +1828,7 @@ func cmdClear(args []string) {
 		fatal("element not found: %v", err)
 	}
 	if humanEnabled(s) {
-		err = humanClick(page, el)
+		err = humanFocusField(page, el)
 		if err == nil {
 			err = el.SelectAllText()
 		}

@@ -18,6 +18,7 @@ func handleHuman(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`<!DOCTYPE html><html><body style="margin:0;height:3000px">
 <input id="name" style="position:absolute;top:100px;left:100px;width:300px;height:30px" value="old">
 <button id="far" style="position:absolute;top:2400px;left:600px;width:160px;height:50px">Far</button>
+<button id="right" style="position:absolute;top:150px;left:3000px;width:120px;height:40px">Right</button>
 <script>
 window.rec = {moves: [], wheel: 0, keys: [], down: 0, up: 0, clicked: null, trusted: true};
 const t = e => { rec.trusted = rec.trusted && e.isTrusted };
@@ -187,7 +188,7 @@ func TestParseScrollArgs(t *testing.T) {
 	if _, sel, err := parseScrollArgs([]string{"#footer"}); err != nil || sel != "#footer" {
 		t.Errorf("selector = (%q, %v)", sel, err)
 	}
-	for _, bad := range [][]string{nil, {"down", "-5"}, {"down", "x"}, {"#a", "10"}} {
+	for _, bad := range [][]string{nil, {"down", "-5"}, {"down", "x"}, {"down", "Inf"}, {"up", "NaN"}, {"#a", "10"}} {
 		if _, _, err := parseScrollArgs(bad); err == nil {
 			t.Errorf("%v should be refused", bad)
 		}
@@ -218,5 +219,41 @@ func TestPointerFile_RejectsOddTargetIDs(t *testing.T) {
 	}
 	if got := pointerFile(&rod.Page{TargetID: "B9B8B11C826582D7829A2DC694FA8CEC"}); !strings.HasPrefix(got, os.Getenv("RODNEY_HOME")) {
 		t.Errorf("pointer file %q should live in the state dir", got)
+	}
+}
+
+func TestHumanClick_ScrollsSideways(t *testing.T) {
+	page := humanPage(t)
+	if err := humanClick(page, page.MustElement("#right")); err != nil {
+		t.Fatal(err)
+	}
+	if got := page.MustEval(`() => rec.clicked`).Str(); got != "right" {
+		t.Errorf("click landed on %q, want #right (3000px to the right)", got)
+	}
+	if page.MustEval(`() => scrollX`).Num() == 0 {
+		t.Error("the page should have scrolled sideways")
+	}
+}
+
+func TestHumanFocusField_OverlayAndFocusTrap(t *testing.T) {
+	t.Setenv("RODNEY_HOME", t.TempDir())
+	page := env.browser.MustPage("data:text/html," + `<!DOCTYPE html><html><body style="margin:0">
+<input id="f" value="x" style="position:absolute;top:50px;left:50px;width:200px;height:30px">
+<div id="shield" style="position:fixed;inset:0;background:rgba(0,0,0,.01)"></div></body></html>`).MustWaitLoad()
+	t.Cleanup(func() { page.MustClose() })
+	el := page.MustElement("#f")
+	if err := humanFocusField(page, el); err != nil {
+		t.Errorf("a field under a passive overlay should still get focus, got %v", err)
+	}
+
+	// A consent dialog that keeps focus: typing would go into it.
+	page.MustEval(`() => {
+		const d = document.createElement("dialog");
+		d.innerHTML = "<button>OK</button>";
+		document.body.append(d);
+		d.showModal();
+	}`)
+	if err := humanFocusField(page, el); err == nil {
+		t.Error("a modal dialog makes the page inert: the field must refuse")
 	}
 }
