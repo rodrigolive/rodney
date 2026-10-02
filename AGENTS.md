@@ -7,6 +7,7 @@ rodrigolive fork of [simonw/rodney](https://github.com/simonw/rodney): a CLI tha
 - `make vet` after every change (go vet + gofmt check + compile tests); `make test` for the full suite; `make install` to replace `~/util/rodney`.
 - `make test-sh` runs `test.sh` against `tests/testserver` in a throwaway `RODNEY_HOME`. Never run `./test.sh` bare: it starts and stops whatever session the default state dir points at.
 - CI (`.github/workflows/ci.yml`) runs vet/gofmt/tidy, plus `go test` and `test.sh` on ubuntu and macos. `gh workflow run ci.yml` triggers it by hand.
+- Releases: `make release TAG=rod-vX.Y.Z` once CI is green on the pushed HEAD; `publish.yml` then attaches the macOS/Linux binaries. Fork tags always carry the `rod-` prefix, because upstream owns `vX.Y.Z`. Its PyPI jobs only run on simonw/rodney.
 - Tests are integration-style: `TestMain` boots one real headless Chrome against a shared `httptest` fixture server. Add a fixture route and a `Test…` that asserts on observed behaviour, not a mock.
 - Keep `go.mod` to runtime dependencies (rod, gson) so upstream merges stay clean.
 - Keep the module path `github.com/simonw/rodney` for the same reason.
