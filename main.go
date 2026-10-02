@@ -1014,6 +1014,7 @@ func cmdStart(args []string) {
 		// Either we are replacing, or the old browser is dead; clean up any
 		// helpers still running for it before launching a new one.
 		stopHelpers(s)
+		clearPointers()
 	}
 
 	dataDir := filepath.Join(stateDir(), "chrome-data")
@@ -1277,10 +1278,15 @@ func cmdStop(args []string) {
 	// Chrome writes its Preferences on the way out, and a 'start' right after
 	// edits them; the PID to wait on goes with the state, so wait here.
 	waitChromeExit(s)
-	// The pointer positions belong to this browser's tabs.
-	_ = os.RemoveAll(filepath.Join(stateDir(), "pointer"))
+	clearPointers()
 	removeState()
 	fmt.Println("Chrome stopped")
+}
+
+// clearPointers drops the --human pointer positions kept per tab: they belong
+// to the browser that is going away (stop, or a relaunch).
+func clearPointers() {
+	_ = os.RemoveAll(filepath.Join(stateDir(), "pointer"))
 }
 
 // waitChromeExit waits up to 5s for the session's Chrome to finish exiting

@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
@@ -255,5 +256,51 @@ func TestHumanFocusField_OverlayAndFocusTrap(t *testing.T) {
 	}`)
 	if err := humanFocusField(page, el); err == nil {
 		t.Error("a modal dialog makes the page inert: the field must refuse")
+	}
+}
+
+// dataPage opens an HTML page for one test, with the pointer kept in a temp
+// state dir.
+func dataPage(t *testing.T, html string) *rod.Page {
+	t.Helper()
+	t.Setenv("RODNEY_HOME", t.TempDir())
+	page := env.browser.MustPage("data:text/html," + html).MustWaitLoad()
+	t.Cleanup(func() { page.MustClose() })
+	return page
+}
+
+func TestHumanClick_InsideScrollContainers(t *testing.T) {
+	page := dataPage(t, `<!DOCTYPE html><html><body style="margin:0">
+<div style="height:200px;width:300px;overflow-y:auto"><div style="height:1200px;position:relative">
+<button id="inlist" style="position:absolute;top:900px">In list</button></div></div>
+<div style="width:400px;overflow-x:auto;white-space:nowrap"><span style="display:inline-block;width:900px"></span><button id="incarousel">In carousel</button></div>
+<script>window.clicked = []; addEventListener("click", e => clicked.push(e.target.id), true)</script></body></html>`)
+	for _, id := range []string{"inlist", "incarousel"} {
+		if err := humanClick(page, page.MustElement("#"+id)); err != nil {
+			t.Errorf("%s: %v (rod's own click scrolls nested containers, so must this)", id, err)
+		}
+	}
+	if got := page.MustEval(`() => clicked.join(",")`).Str(); got != "inlist,incarousel" {
+		t.Errorf("clicked %q", got)
+	}
+}
+
+func TestHumanWheel_LongWayFitsTheTimeout(t *testing.T) {
+	page := dataPage(t, `<!DOCTYPE html><html><body style="margin:0;height:40000px">
+<button id="deep" style="position:absolute;top:30000px;left:100px">Deep</button></body></html>`)
+	p := page.Timeout(15 * time.Second)
+	start := time.Now()
+	if err := humanClick(p, p.MustElement("#deep")); err != nil {
+		t.Fatalf("an element 30000px down: %v", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("took %v; wheeling must stay bounded", took)
+	}
+	start = time.Now()
+	if err := humanWheel(p, 1e20); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 6*time.Second {
+		t.Errorf("a huge amount wheeled for %v", took)
 	}
 }

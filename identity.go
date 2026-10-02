@@ -40,6 +40,19 @@ const headlessWindow = "1280,887"
 // ignores the switch and reports the real display, which is fine too).
 const headlessScreen = "{1920x1080}"
 
+// screenFor is the --screen-info for a headless window ("W,H"): 1920x1080,
+// or the window's own size where it is larger, so the window always fits on
+// its screen.
+func screenFor(window string) string {
+	w, h, ok := strings.Cut(window, ",")
+	wi, errW := strconv.Atoi(w)
+	hi, errH := strconv.Atoi(h)
+	if !ok || errW != nil || errH != nil || (wi <= 1920 && hi <= 1080) {
+		return headlessScreen
+	}
+	return fmt.Sprintf("{%dx%d}", max(wi, 1920), max(hi, 1080))
+}
+
 var chromeVersionRE = regexp.MustCompile(`(\d+)\.\d+\.\d+\.\d+`)
 
 // resolveChromeBin returns the browser 'start' launches: ROD_CHROME_BIN, else
@@ -113,7 +126,7 @@ func configureIdentity(l *launcher.Launcher, opts startOpts, bin, goos string) (
 			// Screenshots stay 1280x800 pixels on HiDPI Macs, as with the
 			// emulated device this replaces.
 			l.Set("force-device-scale-factor", "1")
-			l.Set("screen-info", headlessScreen)
+			l.Set("screen-info", screenFor(window))
 		}
 	}
 	if opts.lang != "" {

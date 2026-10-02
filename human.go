@@ -292,8 +292,14 @@ func humanWheel(page *rod.Page, dy float64) error {
 	return humanWheelXY(page, 0, dy)
 }
 
+// maxNotches bounds the wheel events of one scroll, about 3s of wheeling.
+const maxNotches = 40
+
 // humanWheelXY scrolls by dy, then dx (a horizontal wheel or Shift+wheel), in
-// notches at the pointer.
+// notches at the pointer. Notches are about 100px, but there are never more
+// than maxNotches: a long way goes in bigger steps, as an accelerated wheel or
+// a trackpad flick sends, so it fits the command's timeout, and a huge amount
+// can't wheel forever.
 func humanWheelXY(page *rod.Page, dx, dy float64) error {
 	at := pointerStart(page)
 	for _, axis := range []struct {
@@ -304,8 +310,13 @@ func humanWheelXY(page *rod.Page, dx, dy float64) error {
 		if d < 0 {
 			sign, d = -1, -d
 		}
-		for d > 0 {
-			notch := math.Min(d, 100+float64(rand.IntN(21)-10))
+		steps := int(math.Min(math.Ceil(d/100), maxNotches))
+		per := d / math.Max(float64(steps), 1)
+		for i := 0; i < steps; i++ {
+			notch := per * (0.9 + 0.2*rand.Float64())
+			if i == steps-1 || notch > d {
+				notch = d
+			}
 			ev := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseWheel, X: at.X, Y: at.Y}
 			if axis.vertical {
 				ev.DeltaY = sign * notch
@@ -374,6 +385,17 @@ func humanPointAt(page *rod.Page, el *rod.Element) (point, error) {
 		return point{}, err
 	}
 	at, ok := visiblePointIn(el, box)
+	if !ok {
+		// Clipped by a scroll container of its own (a carousel, a list, a
+		// dialog's scrolling body): the page is where it should be, the
+		// container isn't. Let the browser scroll the containers, then aim.
+		if err := el.ScrollIntoView(); err == nil {
+			if box, err = elementBox(el); err != nil {
+				return point{}, err
+			}
+			at, ok = visiblePointIn(el, box)
+		}
+	}
 	if !ok {
 		if _, err := el.Interactable(); err != nil {
 			return point{}, err

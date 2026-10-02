@@ -86,8 +86,8 @@ func TestConfigureIdentity_HeadlessScreen(t *testing.T) {
 		}
 		// Current headless Chrome reports 800x600 on macOS too, under a
 		// 1280x887 window.
-		if got := l.Get("screen-info"); got != headlessScreen {
-			t.Errorf("%s: screen-info = %q, want %q", goos, got, headlessScreen)
+		if got := l.Get("screen-info"); got != screenFor(headlessWindow) {
+			t.Errorf("%s: screen-info = %q, want %q", goos, got, screenFor(headlessWindow))
 		}
 	}
 }
@@ -371,5 +371,19 @@ func TestProxiedViaArgs(t *testing.T) {
 	}
 	if proxiedViaArgs([]string{"--use-angle=gl"}) {
 		t.Error("no proxy switch: not proxied")
+	}
+}
+
+func TestScreenFor(t *testing.T) {
+	for window, want := range map[string]string{
+		"1280,887":  "{1920x1080}",
+		"1920,1080": "{1920x1080}",
+		"2560,1440": "{2560x1440}",
+		"1920,1200": "{1920x1200}",
+		"bad":       "{1920x1080}",
+	} {
+		if got := screenFor(window); got != want {
+			t.Errorf("screenFor(%q) = %q, want %q (the window must fit its screen)", window, got, want)
+		}
 	}
 }
