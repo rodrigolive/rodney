@@ -142,6 +142,9 @@ Environment:
   RODNEY_START_FLAGS              Default 'start' options, e.g. "--show --timezone
                                   Europe/Madrid" (command-line options win)
   RODNEY_HUMAN                    1/0: humanlike input on/off for this command
+  RODNEY_NO_CLIENT_HINTS          Hosts whose pages get no User-Agent client hints
+                                  (default reddit.com,redd.it,redditmedia.com, where
+                                  recent Chrome sending them is challenged; none: off)
   ROD_CHROME_BIN                  Browser to launch (default: rod's Chromium)
   ROD_TIMEOUT                     Default timeout in seconds (default: 30)
   RODNEY_DEBUG                    Show full Go stack traces instead of clean errors

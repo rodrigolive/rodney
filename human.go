@@ -301,6 +301,7 @@ const maxNotches = 40
 // a trackpad flick sends, so it fits the command's timeout, and a huge amount
 // can't wheel forever.
 func humanWheelXY(page *rod.Page, dx, dy float64) error {
+	bringToFront(page) // a wheel scrolls the tab in front
 	at := pointerStart(page)
 	for _, axis := range []struct {
 		d        float64
@@ -376,7 +377,12 @@ func humanFocusField(page *rod.Page, el *rod.Element) error {
 // centre and gives up when an overlay covers it, where a person clicks the
 // part they can see. When no sampled point hits el, it refuses with rod's
 // reason (covered by what, or no pointer events).
+//
+// The tab comes to the front first, as it would for a person: in a background
+// tab Chrome hit-tests against a scroll position it hasn't painted yet, so
+// elementFromPoint misses an element a nested container has just scrolled to.
 func humanPointAt(page *rod.Page, el *rod.Element) (point, error) {
+	bringToFront(page)
 	if err := humanScrollIntoView(page, el); err != nil {
 		return point{}, err
 	}

@@ -363,6 +363,23 @@ func TestLaunchIdentity_WhatPagesSee(t *testing.T) {
 	if got.Get("ice").Int() != 0 {
 		t.Errorf("behind a proxy WebRTC must not gather non-proxied candidates, got %d", got.Get("ice").Int())
 	}
+
+	// The Reddit provision (quirks.go): the same page without client hints,
+	// everything else about the request unchanged.
+	if err := withholdClientHints(page, &State{UserAgent: ua}); err != nil {
+		t.Fatal(err)
+	}
+	page.MustNavigate(env.server.URL + "/headers").MustWaitLoad()
+	var withheld struct{ UA, SecChUa, Lang string }
+	if err := json.Unmarshal([]byte(page.MustElement("#h").MustText()), &withheld); err != nil {
+		t.Fatal(err)
+	}
+	if withheld.SecChUa != "" || page.MustEval(`() => (navigator.userAgentData?.brands || []).length`).Int() != 0 {
+		t.Errorf("client hints should be withheld, server saw Sec-CH-UA %q", withheld.SecChUa)
+	}
+	if withheld.UA != ua || withheld.Lang != seen.Lang {
+		t.Errorf("withholding changed the UA (%q) or languages (%q, was %q)", withheld.UA, withheld.Lang, seen.Lang)
+	}
 }
 
 func TestProxiedViaArgs(t *testing.T) {

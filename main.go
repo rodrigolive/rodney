@@ -204,6 +204,7 @@ type State struct {
 	LaunchIdentity   bool   `json:"launch_identity,omitempty"`    // UA and window set on Chrome's command line: no per-command emulation
 	NoConsole        bool   `json:"no_console,omitempty"`         // --no-console/--stealth: never run the console sidecar
 	Human            bool   `json:"human,omitempty"`              // --human/--stealth: humanlike pointer, keyboard and wheel input
+	Lang             string `json:"lang,omitempty"`               // --lang: languages pages see (quirks.go keeps them in its UA override)
 
 	Extensions []extensionInfo `json:"extensions,omitempty"` // extensions passed to --load-extension
 }
@@ -701,6 +702,8 @@ func withPageTimeout(timeout time.Duration) (*State, *rod.Browser, *rod.Page) {
 		_ = (proto.NetworkEnable{}).Call(page)
 		_ = (proto.NetworkSetCacheDisabled{CacheDisabled: true}).Call(page)
 	}
+	// Sites that need the browser to look a particular way (quirks.go).
+	applySiteProvisions(page, s)
 	return s, browser, page.Timeout(timeout)
 }
 
@@ -1154,6 +1157,7 @@ func cmdStart(args []string) {
 		LaunchIdentity:   launchIdentity,
 		NoConsole:        opts.noConsole,
 		Human:            opts.human,
+		Lang:             opts.lang,
 		// HTTP cache off by default (--cache keeps it). Toggle with
 		// `rodney no-cache on|off`. The per-command re-apply in
 		// withPageTimeout plus the console-logger's periodic per-page
@@ -1486,6 +1490,11 @@ func cmdOpen(args []string) {
 	if *userAgent != "" {
 		if err := applyUserAgent(page, *userAgent); err != nil {
 			fatal("failed to set user agent: %v", err)
+		}
+	} else if withholdsClientHints(url) {
+		// Before the navigation: Reddit decides on the first response.
+		if err := withholdClientHints(page, s); err != nil {
+			fatal("failed to withhold client hints: %v", err)
 		}
 	}
 
@@ -2360,7 +2369,24 @@ func cmdNewPage(args []string) {
 	}
 
 	var page *rod.Page
-	if url != "" {
+	if url != "" && withholdsClientHints(url) {
+		// A blank tab first, so the override is in place before the first
+		// request (quirks.go).
+		page, err = browser.Page(proto.TargetCreateTarget{})
+		if err != nil {
+			fatal("failed to open page: %v%s", err, navHint(err))
+		}
+		page = page.Timeout(defaultTimeout)
+		if err := withholdClientHints(page, s); err != nil {
+			fatal("failed to withhold client hints: %v", err)
+		}
+		if err := page.Navigate(url); err != nil {
+			fatal("navigation failed: %v%s", err, navHint(err))
+		}
+		if err := page.WaitLoad(); err != nil {
+			fatal("page did not finish loading within %s: %v%s", defaultTimeout, err, navHint(err))
+		}
+	} else if url != "" {
 		page, err = browser.Page(proto.TargetCreateTarget{URL: url})
 		if err != nil {
 			fatal("failed to open page: %v%s", err, navHint(err))
