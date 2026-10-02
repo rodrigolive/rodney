@@ -103,14 +103,17 @@ func applySiteProvisions(page *rod.Page, s *State) {
 }
 
 // applyHistoryProvisions applies the provision for the history entry that
-// back (step -1) or forward (+1) is about to load, which is fetched again:
-// rodney sessions run with the cache disabled.
+// back (step -1) or forward (+1) is about to load. Chrome usually restores it
+// from the back/forward cache without a request; when it can't (evicted, or a
+// page it won't cache) the entry is fetched again, and that request is the
+// one this covers.
 func applyHistoryProvisions(page *rod.Page, s *State, step int) {
 	if len(noClientHintsHosts()) == 0 {
 		return
 	}
 	h, err := proto.PageGetNavigationHistory{}.Call(page)
 	if err != nil {
+		warnWithhold(fmt.Errorf("reading the tab's history: %w", err))
 		return
 	}
 	i := h.CurrentIndex + step

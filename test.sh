@@ -218,9 +218,14 @@ OUT=$($CLI --target "$HINTS_ID" text "#ch" 2>&1)
 assert_eq "$OUT" "" "newpage withholds client hints on its first request"
 $CLI closepage "$HINTS_ID" >/dev/null 2>&1
 
+# back is usually served from the back/forward cache with no request at all;
+# without it the entry is fetched again, which is the case the provision
+# covers, so this check runs in a browser that has it off.
+$CLI start --replace --chrome-arg=--disable-features=BackForwardCache >/dev/null 2>&1
+$CLI open http://127.0.0.1:18080/hints >/dev/null 2>&1
 $CLI open http://localhost:18080/ >/dev/null 2>&1
-OUT=$($CLI back 2>&1 >/dev/null; $CLI text "#ch" 2>&1)
-assert_eq "$OUT" "" "back into a provisioned host withholds them too"
+OUT=$($CLI back 2>/dev/null >/dev/null; $CLI text "#ch" 2>&1)
+assert_eq "$OUT" "" "back into a provisioned host withholds them on the refetch"
 unset RODNEY_NO_CLIENT_HINTS
 
 # --- Cleanup ---
