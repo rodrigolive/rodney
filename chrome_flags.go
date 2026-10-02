@@ -44,13 +44,16 @@ func singleProcessSupported() bool {
 // starts biting once a profile has been used for a while — a long-lived
 // ~/.rodney profile crashes where a throwaway one does not.
 //
-// --disable-field-trial-config drops that config wholesale, so rodney drives a
-// browser with shipped defaults rather than whatever happened to be mid-flight
-// when the snapshot was cut. HistoryEmbeddings is named explicitly as well
-// because a browser supplied through ROD_CHROME_BIN can enable it from a
-// server-side variations seed, which that switch does not cover.
+// HistoryEmbeddings is switched off by name, which beats both that config and
+// a server-side variations seed (a browser supplied through ROD_CHROME_BIN can
+// get it from one).
+//
+// The config itself stays. Dropping it wholesale (--disable-field-trial-config,
+// as rodney did at first) leaves the snapshot with a feature set no released
+// Chrome 128 ever had, and pages that compare what the browser can do with the
+// version it claims notice: Reddit's JS challenge refuses such a browser
+// ("Prove your humanity") and passes it once the config is back.
 func configureExperiments(l *launcher.Launcher) *launcher.Launcher {
 	// Append, not Set: rod already disables features of its own.
-	return l.Set("disable-field-trial-config").
-		Append("disable-features", "HistoryEmbeddings")
+	return l.Append("disable-features", "HistoryEmbeddings")
 }

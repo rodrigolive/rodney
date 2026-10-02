@@ -38,7 +38,7 @@ func TestMain(m *testing.M) {
 		Leakless(false)
 
 	// Same platform flags as 'rodney start', so macOS runs test the browser
-	// users actually get (no --single-process, no field-trial experiments).
+	// users actually get (no --single-process, HistoryEmbeddings off).
 	if singleProcessSupported() {
 		l = l.Set("single-process")
 	}
@@ -63,6 +63,8 @@ func TestMain(m *testing.M) {
 	mux.HandleFunc("/hang", handleHang)
 	mux.HandleFunc("/notfound", handleNotFound)
 	mux.HandleFunc("/ua", handleUA)
+	mux.HandleFunc("/headers", handleHeaders)
+	mux.HandleFunc("/human", handleHuman)
 	server := httptest.NewServer(mux)
 
 	env = &testEnv{browser: browser, server: server}
@@ -1590,11 +1592,14 @@ func TestApplyUserAgent(t *testing.T) {
 	}
 }
 
-func TestApplyStealthFlags(t *testing.T) {
+func TestHideAutomation(t *testing.T) {
 	l := launcher.New()
-	applyStealthFlags(l)
+	hideAutomation(l)
 	if got := l.Get("disable-blink-features"); got != "AutomationControlled" {
-		t.Errorf("stealth should disable the AutomationControlled blink feature, got %q", got)
+		t.Errorf("the AutomationControlled blink feature should be disabled, got %q", got)
+	}
+	if l.Has("enable-automation") {
+		t.Error("--enable-automation should be removed (it sets navigator.webdriver)")
 	}
 }
 

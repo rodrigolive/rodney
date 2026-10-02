@@ -45,6 +45,10 @@ No malicious code turned up. Two branches had real safety problems; one was fixe
 - **`--page` was being ignored.** After merging, the saved tab was always checked first. The order is now `--page`, then `--target`, then the saved tab.
 - **Console log privacy.** `console.log` captures output from every tab, which can include tokens. It's now readable only by its owner, and the capture process stays attached to the session that started it.
 - **`js --json` waits for promises** instead of printing `{}`. Scripts passed with `--file` or stdin can end with `;` or a `//` comment.
+- **What pages can tell about the browser is set at launch.** rodney runs one process per command, and Chrome drops every CDP override (User-Agent, viewport) when the command that set it exits. So after `rodney open` returned, a page's later requests and scripts saw the raw headless browser: `HeadlessChrome` in the UA, an 800x600 screen, empty `navigator.userAgentData`, no `Sec-CH-UA` headers. Headless sessions now get the real UA minus "Headless" on Chrome's command line, plus a window whose page area is still 1280x800. Every session hides `navigator.webdriver`. Behind a proxy, a profile preference stops WebRTC from revealing the host's own IP, which it otherwise did even through the proxy. Measured with [deviceandbrowserinfo.com's bot test](https://deviceandbrowserinfo.com/are_you_a_bot): six signals before, none with `--stealth`.
+- **`--human`, `--no-console`, `--stealth`.** `--human` makes `click`, `input`, `clear`, `hover` and the new `scroll` act like a person. The pointer follows curved paths sized by Fitts's law, borrowed from [ghost-cursor](https://github.com/Xetera/ghost-cursor), at minimum-jerk speed. Clicks land on a visible point of the element and hold the button for a human interval. Typing goes key by key with a typist's rhythm, and scrolling uses wheel notches. `--no-console` skips the console capture, whose `Runtime.enable` bot checks detect. `--stealth` is both.
+- **`--timezone`, `--lang`, `--window`, `--chrome-arg`, `RODNEY_START_FLAGS`** let a crawler host present itself as a desktop in the place its IP says it is. For example, a server relayed through a home connection can run headed Chrome under Xvfb with the home's timezone and languages.
+- **The field-trial testing config is back on** for rod's Chromium snapshot; only HistoryEmbeddings, the feature that crashed, is switched off. With the whole config off, the browser's features matched no released Chrome 128, and Reddit's JS challenge refused it.
 - **Tooling.** ejolly's `just`/golangci-lint setup (about 240 extra lines in `go.mod`) is replaced by a `Makefile`. Run `make` for the list of targets. Contributor notes are in [AGENTS.md](AGENTS.md).
 
 ### What was left out, and why
@@ -63,6 +67,8 @@ No malicious code turned up. Two branches had real safety problems; one was fixe
 - The HTTP cache is off by default. Start with `rodney start --cache` for a normally caching browser. `rodney no-cache off` turns HTTP caching back on for a running session, but the disk cache stays off.
 - `rodney start` reuses a browser that's already running, and warns about any launch options it had to ignore. Use `--replace` to restart it.
 - On macOS, Chrome no longer runs with `--single-process`.
+- `navigator.webdriver` is false and the automation infobar is gone in every session. `--stealth` now means `--human --no-console`. It no longer swaps in a fixed Mac Chrome 131 UA, because every session now gets the real browser's UA.
+- `--disable-gpu` is only passed to headless Chrome on Linux. Headless macOS renders WebGL on the real GPU, and headed windows keep theirs.
 
 ### Install
 

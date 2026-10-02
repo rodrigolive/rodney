@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/devices"
+	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
@@ -198,7 +200,10 @@ type State struct {
 	ConsoleLoggerPID int    `json:"console_logger_pid,omitempty"` // PID of console-capture sidecar
 	NoCacheDisabled  bool   `json:"no_cache_disabled,omitempty"`  // re-apply Network.setCacheDisabled on every command
 	Visible          bool   `json:"visible,omitempty"`            // --show or connect: skip go-rod's device emulation
-	UserAgent        string `json:"user_agent,omitempty"`         // UA for the headless device emulation
+	UserAgent        string `json:"user_agent,omitempty"`         // UA for the headless device emulation (sessions without LaunchIdentity)
+	LaunchIdentity   bool   `json:"launch_identity,omitempty"`    // UA and window set on Chrome's command line: no per-command emulation
+	NoConsole        bool   `json:"no_console,omitempty"`         // --no-console/--stealth: never run the console sidecar
+	Human            bool   `json:"human,omitempty"`              // --human/--stealth: humanlike pointer, keyboard and wheel input
 
 	Extensions []extensionInfo `json:"extensions,omitempty"` // extensions passed to --load-extension
 }
@@ -289,10 +294,14 @@ func removeState() {
 // headless window size and send a "HeadlessChrome" User-Agent, but the UA is
 // replaced by the one pinned at start (see headlessFreeUserAgent). State files
 // from before that field existed get go-rod's stock device, as upstream did.
+//
+// Sessions started with LaunchIdentity have their UA and window size on
+// Chrome's command line (see identity.go), which holds between commands; the
+// per-command emulation above lapses when each command exits, so they skip it.
 func connectBrowser(s *State) (*rod.Browser, error) {
 	browser := rod.New().ControlURL(s.DebugURL)
 	switch {
-	case s.Visible:
+	case s.Visible || s.LaunchIdentity:
 		browser = browser.NoDefaultDevice()
 	case s.UserAgent != "":
 		device := devices.LaptopWithMDPIScreen
@@ -540,6 +549,8 @@ func main() {
 		cmdSubmit(args)
 	case "hover":
 		cmdHover(args)
+	case "scroll":
+		cmdScroll(args)
 	case "file":
 		cmdFile(args)
 	case "download":
@@ -604,7 +615,7 @@ var commandNames = []string{
 	"start", "connect", "stop", "status", "version", "extensions",
 	"open", "back", "forward", "reload", "clear-cache", "no-cache",
 	"url", "title", "html", "text", "attr", "pdf",
-	"js", "click", "input", "clear", "select", "submit", "hover", "file", "download", "focus",
+	"js", "click", "input", "clear", "select", "submit", "hover", "scroll", "file", "download", "focus",
 	"wait", "waitload", "waitstable", "waitidle", "sleep",
 	"screenshot", "screenshot-el",
 	"pages", "page", "newpage", "closepage",
@@ -843,23 +854,12 @@ func applyUserAgent(page *rod.Page, ua string) error {
 	return page.SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: ua})
 }
 
-// stealthUserAgent is a realistic desktop Chrome UA used by --stealth when no
-// explicit --user-agent is given, so the headless give-away ("HeadlessChrome")
-// is removed from requests.
-const stealthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-// applyStealthFlags sets launcher flags that hide the most common headless
-// automation tells (navigator.webdriver via AutomationControlled, and the
-// automation banner). Lightweight, launch-only — not a full anti-bot bypass.
-func applyStealthFlags(l *launcher.Launcher) {
-	l.Set("disable-blink-features", "AutomationControlled")
-	l.Delete("enable-automation")
-}
-
 // headlessFreeUserAgent returns the launched browser's own User-Agent with
 // "HeadlessChrome" swapped for "Chrome", so the version matches the real
 // binary (go-rod's stock device claims Chrome/114, which modern apps reject).
 // Returns "" if the browser can't be asked, which keeps go-rod's default.
+// Only used when the binary's version can't be read before launch, so the UA
+// can't go on the command line (see identity.go).
 func headlessFreeUserAgent(debugURL string) string {
 	browser := rod.New().ControlURL(debugURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
@@ -895,7 +895,7 @@ func bringToFront(page *rod.Page) {
 
 // --- Commands ---
 
-const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth] [--replace] [--extension PATH] [--cache]"
+const startUsage = "usage: rodney start [--show] [--insecure] [--user-agent UA] [--stealth] [--human] [--no-console] [--timezone TZ] [--lang LIST] [--window WxH] [--chrome-arg ARG] [--replace] [--extension PATH] [--cache]"
 
 // startOpts holds the parsed flags for the "start" command.
 type startOpts struct {
@@ -906,7 +906,19 @@ type startOpts struct {
 	replace    bool
 	extensions []string
 	cache      bool // keep Chrome's normal HTTP/disk cache instead of disabling it
+	human      bool // humanlike input for the session (also implied by stealth)
+	noConsole  bool // no console sidecar (also implied by stealth)
+	timezone   string
+	lang       string
+	window     string
+	chromeArgs []string
 }
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, " ") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 // parseStartArgs parses the flags for the "start" command.
 func parseStartArgs(args []string) (startOpts, error) {
@@ -914,6 +926,7 @@ func parseStartArgs(args []string) (startOpts, error) {
 	fs.SetOutput(io.Discard)
 	var o startOpts
 	var extensions extensionList
+	var chromeArgs stringList
 	fs.BoolVar(&o.insecure, "insecure", false, "")
 	fs.BoolVar(&o.insecure, "k", false, "")
 	fs.StringVar(&o.userAgent, "user-agent", "", "")
@@ -922,6 +935,12 @@ func parseStartArgs(args []string) (startOpts, error) {
 	fs.BoolVar(&o.replace, "force", false, "")
 	fs.Var(&extensions, "extension", "")
 	fs.BoolVar(&o.cache, "cache", false, "")
+	fs.BoolVar(&o.human, "human", false, "")
+	fs.BoolVar(&o.noConsole, "no-console", false, "")
+	fs.StringVar(&o.timezone, "timezone", "", "")
+	fs.StringVar(&o.lang, "lang", "", "")
+	fs.StringVar(&o.window, "window", "", "")
+	fs.Var(&chromeArgs, "chrome-arg", "")
 	show := fs.Bool("show", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
@@ -932,14 +951,34 @@ func parseStartArgs(args []string) (startOpts, error) {
 	}
 	o.headless = !*show
 	o.extensions = extensions
+	o.chromeArgs = chromeArgs
+	if o.stealth {
+		o.human, o.noConsole = true, true
+	}
+	if o.timezone != "" && !validTimezone(o.timezone) {
+		return startOpts{headless: true}, fmt.Errorf("unknown --timezone %q (want an IANA name such as Europe/Madrid)", o.timezone)
+	}
+	if _, err := launchWindow(o.window, o.headless); err != nil {
+		return startOpts{headless: true}, err
+	}
 	return o, nil
 }
 
+// startArgs returns the arguments 'start' runs with: RODNEY_START_FLAGS
+// (whitespace-separated, for hosts where a service manager runs 'start') and
+// then the command line's own, which win where they conflict.
+func startArgs(args []string) []string {
+	return append(strings.Fields(os.Getenv("RODNEY_START_FLAGS")), args...)
+}
+
 func cmdStart(args []string) {
-	opts, err := parseStartArgs(args)
+	opts, err := parseStartArgs(startArgs(args))
 	if err != nil {
 		fatal("%s", err)
 	}
+	// Warn only about options given on this command line: RODNEY_START_FLAGS
+	// are standing defaults, not a request to relaunch a running browser.
+	explicit, _ := parseStartArgs(args)
 	ignoreCertErrors, headless := opts.insecure, opts.headless
 
 	// If a session already exists, default to reusing it rather than killing it —
@@ -952,11 +991,11 @@ func cmdStart(args []string) {
 				fmt.Printf("Chrome already running (PID %d)\n", s.ChromePID)
 				fmt.Printf("Debug URL: %s\n", s.DebugURL)
 				fmt.Println("Reusing the existing session (use 'rodney start --replace' to restart it)")
-				if ignored := ignoredOnReuse(opts); len(ignored) > 0 {
+				if ignored := ignoredOnReuse(explicit); len(ignored) > 0 {
 					fmt.Fprintf(os.Stderr, "warning: ignored %s for the running browser; use 'rodney start --replace' to relaunch with them\n", strings.Join(ignored, ", "))
 				}
 				// A sidecar that died would leave 'rodney console' empty forever.
-				if s.ChromePID > 0 && !processCommandContains(s.ConsoleLoggerPID, "_console_logger") {
+				if s.ChromePID > 0 && !s.NoConsole && !processCommandContains(s.ConsoleLoggerPID, "_console_logger") {
 					if pid := startConsoleLogger(s.DebugURL); pid > 0 {
 						s.ConsoleLoggerPID = pid
 						if err := saveState(s); err == nil {
@@ -968,6 +1007,9 @@ func cmdStart(args []string) {
 			}
 			b.MustClose()
 			removeState()
+			// Chrome writes its Preferences on the way out; the new launch
+			// edits them, so the old one has to be gone first.
+			waitChromeExit(s)
 		}
 		// Either we are replacing, or the old browser is dead; clean up any
 		// helpers still running for it before launching a new one.
@@ -983,10 +1025,12 @@ func cmdStart(args []string) {
 
 	l := launcher.New().
 		Set("no-sandbox").
-		Set("disable-gpu").
 		Leakless(false). // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
+	if gpuDisabled(headless, runtime.GOOS) {
+		l = l.Set("disable-gpu")
+	}
 
 	// Unless --cache, effectively disable the disk and media caches at the
 	// Chrome process level. Browser-UI reloads, DevTools reloads, and scripted
@@ -1006,30 +1050,30 @@ func cmdStart(args []string) {
 	l = configureExperiments(l)
 
 	// When in non-headless mode, show the startup window immediately and
-	// open it maximized so users don't get a small fixed-size window.
+	// open it maximized so users don't get a small fixed-size window (unless
+	// --window sizes it: without a window manager, as under Xvfb, nothing
+	// maximizes it).
 	if !headless {
 		l = l.Delete("no-startup-window")
-		l = l.Set("start-maximized")
+		if opts.window == "" {
+			l = l.Set("start-maximized")
+		}
 		l = l.Set("profile-directory", "Default")
 	}
 
 	l = configureExtensions(l, headless, extensions)
 
-	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
-		l = l.Bin(bin)
+	bin, err := resolveChromeBin()
+	if err != nil {
+		fatal("failed to find a browser: %v", err)
 	}
+	l = l.Bin(bin)
 
-	// Stealth + user-agent: --stealth hides the headless automation tells and,
-	// absent an explicit --user-agent, swaps in a non-headless UA.
-	ua := opts.userAgent
-	if opts.stealth {
-		applyStealthFlags(l)
-		if ua == "" {
-			ua = stealthUserAgent
-		}
-	}
-	if ua != "" {
-		l.Set("user-agent", ua)
+	// What pages can see of the browser is set here, on the command line,
+	// because per-command CDP overrides lapse between commands (identity.go).
+	ua, launchIdentity := configureIdentity(l, opts, bin, runtime.GOOS)
+	if err := applyChromeArgs(l, opts.chromeArgs); err != nil {
+		fatal("%v", err)
 	}
 
 	// Detect authenticated proxy and launch helper if needed
@@ -1069,21 +1113,31 @@ func cmdStart(args []string) {
 		l.Set("ignore-certificate-errors")
 	}
 
+	proxied := proxyPort > 0 || proxiedViaEnv(runtime.GOOS)
+	if err := writeProfilePrefs(dataDir, identityPrefs(proxied, opts.lang)); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not set profile preferences (WebRTC policy, languages): %v\n", err)
+	}
+
 	debugURL := l.MustLaunch()
 
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
-	// Headless commands emulate a 1280x800 device, which overrides the UA per
-	// page (see connectBrowser). Pin it to the UA asked for, or else to the
+	// Without a launch identity, headless commands emulate a 1280x800 device,
+	// which overrides the UA per page (see connectBrowser). Pin it to the
 	// browser's own UA without the "HeadlessChrome" tell.
 	sessionUA := ua
-	if headless && sessionUA == "" {
+	if headless && !launchIdentity {
 		sessionUA = headlessFreeUserAgent(debugURL)
 	}
 
 	// Launch console-capture sidecar so 'rodney console' can replay output.
-	consoleLoggerPID := startConsoleLogger(debugURL)
+	// It keeps the Runtime domain enabled on every tab, which is one of the
+	// signals anti-bot scripts probe for, so --no-console/--stealth skip it.
+	consoleLoggerPID := 0
+	if !opts.noConsole {
+		consoleLoggerPID = startConsoleLogger(debugURL)
+	}
 
 	state := &State{
 		DebugURL:         debugURL,
@@ -1096,6 +1150,9 @@ func cmdStart(args []string) {
 		ConsoleLoggerPID: consoleLoggerPID,
 		Visible:          !headless,
 		UserAgent:        sessionUA,
+		LaunchIdentity:   launchIdentity,
+		NoConsole:        opts.noConsole,
+		Human:            opts.human,
 		// HTTP cache off by default (--cache keeps it). Toggle with
 		// `rodney no-cache on|off`. The per-command re-apply in
 		// withPageTimeout plus the console-logger's periodic per-page
@@ -1221,6 +1278,18 @@ func cmdStop(args []string) {
 	fmt.Println("Chrome stopped")
 }
 
+// waitChromeExit waits up to 5s for the session's Chrome to finish exiting
+// after a close, so what it writes to the profile on the way out can't land
+// on top of the next launch's changes.
+func waitChromeExit(s *State) {
+	if s.ChromePID <= 0 || s.DataDir == "" {
+		return
+	}
+	for i := 0; i < 50 && processCommandContains(s.ChromePID, "--user-data-dir="+s.DataDir); i++ {
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // stopHelpers ends the auth proxy and console sidecar recorded in s, but only
 // if each PID is still running that helper: a recycled PID must never be hit.
 func stopHelpers(s *State) {
@@ -1275,6 +1344,24 @@ func ignoredOnReuse(opts startOpts) []string {
 	if opts.cache {
 		ignored = append(ignored, "--cache")
 	}
+	if opts.human && !opts.stealth {
+		ignored = append(ignored, "--human")
+	}
+	if opts.noConsole && !opts.stealth {
+		ignored = append(ignored, "--no-console")
+	}
+	if opts.timezone != "" {
+		ignored = append(ignored, "--timezone")
+	}
+	if opts.lang != "" {
+		ignored = append(ignored, "--lang")
+	}
+	if opts.window != "" {
+		ignored = append(ignored, "--window")
+	}
+	if len(opts.chromeArgs) > 0 {
+		ignored = append(ignored, "--chrome-arg")
+	}
 	return ignored
 }
 
@@ -1300,6 +1387,12 @@ func cmdStatus(args []string) {
 	fmt.Printf("Pages: %d\n", len(pages))
 	for _, ext := range s.Extensions {
 		fmt.Printf("Extension: %s (%s)\n", ext.Name, ext.ID)
+	}
+	if humanEnabled(s) {
+		fmt.Println("Input: humanlike")
+	}
+	if s.NoConsole {
+		fmt.Println("Console capture: off")
 	}
 	if page, err := getActivePage(browser, s); err == nil {
 		fmt.Printf("Active target: %s\n", page.TargetID)
@@ -1675,12 +1768,17 @@ func cmdClick(args []string) {
 	if len(args) < 1 {
 		fatal("usage: rodney click <selector>")
 	}
-	_, _, page := withPage()
+	s, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
+	if humanEnabled(s) {
+		err = humanClick(page, el)
+	} else {
+		err = el.Click(proto.InputMouseButtonLeft, 1)
+	}
+	if err != nil {
 		fatal("click failed: %v", err)
 	}
 	// Brief pause for click handlers to execute
@@ -1692,13 +1790,35 @@ func cmdInput(args []string) {
 	if len(args) < 2 {
 		fatal("usage: rodney input <selector> <text>")
 	}
-	_, _, page := withPage()
+	s, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
 	text := strings.Join(args[1:], " ")
-	el.MustSelectAllText().MustInput(text)
+	if humanEnabled(s) {
+		// Click into the field, select what's there, and type over it. A
+		// field nothing can click (an overlay over all of it) still gets
+		// focus, and the typing stays key by key, unless a modal that traps
+		// focus (a consent dialog) takes it back: then the keys would land in
+		// the dialog, so it refuses with the click's reason.
+		page = page.CancelTimeout().Timeout(humanTimeout(text))
+		el = el.Context(page.GetContext())
+		if clickErr := humanClick(page, el); clickErr != nil {
+			focused, err := el.Eval(`function () { this.focus(); return document.activeElement === this }`)
+			if err != nil || !focused.Value.Bool() {
+				fatal("input failed: %v", clickErr)
+			}
+		}
+		if err := el.SelectAllText(); err != nil {
+			fatal("input failed: %v", err)
+		}
+		if err := humanType(page, text); err != nil {
+			fatal("input failed: %v", err)
+		}
+	} else {
+		el.MustSelectAllText().MustInput(text)
+	}
 	fmt.Printf("Typed: %s\n", text)
 }
 
@@ -1706,12 +1826,25 @@ func cmdClear(args []string) {
 	if len(args) < 1 {
 		fatal("usage: rodney clear <selector>")
 	}
-	_, _, page := withPage()
+	s, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
-	el.MustSelectAllText().MustInput("")
+	if humanEnabled(s) {
+		err = humanClick(page, el)
+		if err == nil {
+			err = el.SelectAllText()
+		}
+		if err == nil {
+			err = humanKey(page, input.Backspace)
+		}
+		if err != nil {
+			fatal("clear failed: %v", err)
+		}
+	} else {
+		el.MustSelectAllText().MustInput("")
+	}
 	fmt.Println("Cleared")
 }
 
@@ -1949,12 +2082,18 @@ func cmdHover(args []string) {
 	if len(args) < 1 {
 		fatal("usage: rodney hover <selector>")
 	}
-	_, _, page := withPage()
+	s, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
 		fatal("element not found: %v", err)
 	}
-	el.MustHover()
+	if humanEnabled(s) {
+		if _, err := humanPointAt(page, el); err != nil {
+			fatal("hover failed: %v", err)
+		}
+	} else {
+		el.MustHover()
+	}
 	fmt.Println("Hovered")
 }
 
@@ -3136,10 +3275,16 @@ func cmdConsole(args []string) {
 		return
 	}
 
+	// stdout stays empty for scripts; tell humans and agents why. A log left
+	// by an earlier session in this state dir isn't this browser's output.
+	if s, err := loadState(); err == nil && s.NoConsole {
+		fmt.Fprintln(os.Stderr, "console capture is off for this session (started with --no-console or --stealth)")
+		return
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// stdout stays empty for scripts; tell humans and agents why.
 			fmt.Fprintln(os.Stderr, "no console output captured yet (sessions from 'rodney connect' have no capture; for a started browser, 'rodney start' restarts a dead capture process)")
 			return
 		}

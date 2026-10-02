@@ -17,17 +17,20 @@ func features(l *launcher.Launcher) string {
 	return strings.Join(values, ",")
 }
 
-// HistoryEmbeddings runs in the browser process, so its CHECK failure takes the
-// whole browser down rather than one tab. It is enabled by the field-trial
-// testing config baked into the pinned Chromium snapshot.
-func TestConfigureExperiments_DisablesFieldTrialConfig(t *testing.T) {
+// The field-trial testing config stays on: without it the snapshot's feature
+// set matches no released Chrome, which bot checks that compare features with
+// the claimed version catch.
+func TestConfigureExperiments_KeepsFieldTrialConfig(t *testing.T) {
 	l := configureExperiments(launcher.New())
 
-	if !l.Has("disable-field-trial-config") {
-		t.Error("--disable-field-trial-config missing; the snapshot will force-enable in-development features")
+	if l.Has("disable-field-trial-config") {
+		t.Error("--disable-field-trial-config makes the browser's feature set inconsistent with its version")
 	}
 }
 
+// HistoryEmbeddings runs in the browser process, so its CHECK failure takes the
+// whole browser down rather than one tab. It is enabled by the field-trial
+// testing config baked into the pinned Chromium snapshot.
 func TestConfigureExperiments_DisablesHistoryEmbeddings(t *testing.T) {
 	l := configureExperiments(launcher.New())
 

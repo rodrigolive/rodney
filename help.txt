@@ -5,13 +5,26 @@ Browser lifecycle:
                                     --show           visible browser window (maximized)
                                     --insecure, -k   ignore TLS errors
                                     --user-agent UA  override the User-Agent
-                                    --stealth        hide common headless automation tells
+                                    --human          humanlike input: curved pointer paths,
+                                                     key-by-key typing, wheel scrolling
+                                    --no-console     no console capture (it keeps the
+                                                     Runtime domain on, an automation tell)
+                                    --stealth        --human plus --no-console
+                                    --timezone TZ    IANA zone pages see (e.g. Europe/Madrid)
+                                    --lang LIST      languages pages see (e.g. en-US,en,es)
+                                    --window WxH     window size (default headless: 1280x887,
+                                                     a 1280x800 page area)
+                                    --chrome-arg ARG extra Chrome switch, e.g.
+                                                     --chrome-arg=--use-angle=gl; repeatable
                                     --replace        restart even if a session is already running
                                     --extension PATH load an unpacked dir or .crx/.zip
                                                      archive; repeat for several
                                     --cache          keep the HTTP/disk cache (off by default)
                                   On a running session, options are ignored (with a
-                                  warning) unless --replace is given.
+                                  warning) unless --replace is given. Every session
+                                  hides navigator.webdriver, sends the browser's real
+                                  UA minus "Headless", and, behind a proxy, keeps
+                                  WebRTC from revealing the host's own address.
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
@@ -57,6 +70,10 @@ Interaction:
   rodney submit <selector>        Submit a form
   rodney hover <selector>         Hover over an element
   rodney focus <selector>         Focus an element
+  rodney scroll <down|up> [PX]    Scroll the page (default 600px)
+  rodney scroll <selector>        Scroll an element into view
+                                  click, input, clear, hover and scroll act like
+                                  a person in --human sessions or with RODNEY_HUMAN=1
 
 Waiting (all accept --timeout SEC):
   rodney wait <selector>          Wait for element to appear
@@ -122,6 +139,10 @@ Environment:
   RODNEY_HOME                     Override data directory (default: ~/.rodney)
   RODNEY_SESSION                  Isolate state under sessions/NAME (own Chrome)
   RODNEY_TARGET                   Operate on the tab with this target id
+  RODNEY_START_FLAGS              Default 'start' options, e.g. "--show --timezone
+                                  Europe/Madrid" (command-line options win)
+  RODNEY_HUMAN                    1/0: humanlike input on/off for this command
+  ROD_CHROME_BIN                  Browser to launch (default: rod's Chromium)
   ROD_TIMEOUT                     Default timeout in seconds (default: 30)
   RODNEY_DEBUG                    Show full Go stack traces instead of clean errors
 
