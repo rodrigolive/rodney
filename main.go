@@ -702,9 +702,11 @@ func withPageTimeout(timeout time.Duration) (*State, *rod.Browser, *rod.Page) {
 		_ = (proto.NetworkEnable{}).Call(page)
 		_ = (proto.NetworkSetCacheDisabled{CacheDisabled: true}).Call(page)
 	}
-	// Sites that need the browser to look a particular way (quirks.go).
+	// Sites that need the browser to look a particular way (quirks.go), on
+	// the timed page: a wedged tab mustn't hang the command.
+	page = page.Timeout(timeout)
 	applySiteProvisions(page, s)
-	return s, browser, page.Timeout(timeout)
+	return s, browser, page
 }
 
 // parseFlagsInterspersed parses fs against args where flags and positional
@@ -1493,9 +1495,7 @@ func cmdOpen(args []string) {
 		}
 	} else if withholdsClientHints(url) {
 		// Before the navigation: Reddit decides on the first response.
-		if err := withholdClientHints(page, s); err != nil {
-			fatal("failed to withhold client hints: %v", err)
-		}
+		warnWithhold(withholdClientHints(page, s))
 	}
 
 	// Capture the document status only when --expect-ok asks for it (it adds a
@@ -1541,7 +1541,8 @@ func cmdOpen(args []string) {
 }
 
 func cmdBack(args []string) {
-	_, _, page := withPage()
+	s, _, page := withPage()
+	applyHistoryProvisions(page, s, -1)
 	if err := page.NavigateBack(); err != nil {
 		fatal("back failed: %v%s", err, navHint(err))
 	}
@@ -1555,7 +1556,8 @@ func cmdBack(args []string) {
 }
 
 func cmdForward(args []string) {
-	_, _, page := withPage()
+	s, _, page := withPage()
+	applyHistoryProvisions(page, s, +1)
 	if err := page.NavigateForward(); err != nil {
 		fatal("forward failed: %v%s", err, navHint(err))
 	}
@@ -2377,10 +2379,9 @@ func cmdNewPage(args []string) {
 			fatal("failed to open page: %v%s", err, navHint(err))
 		}
 		page = page.Timeout(defaultTimeout)
-		if err := withholdClientHints(page, s); err != nil {
-			fatal("failed to withhold client hints: %v", err)
-		}
+		warnWithhold(withholdClientHints(page, s))
 		if err := page.Navigate(url); err != nil {
+			_ = page.Close() // fatal skips deferred cleanup; don't leave a blank tab
 			fatal("navigation failed: %v%s", err, navHint(err))
 		}
 		if err := page.WaitLoad(); err != nil {

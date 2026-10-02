@@ -3,6 +3,7 @@
 package main
 
 import (
+	"html"
 	"log"
 	"net/http"
 )
@@ -45,9 +46,18 @@ func page(html string) http.HandlerFunc {
 	}
 }
 
+// hints echoes the User-Agent client hint the request carried, so test.sh can
+// check the site provisions (quirks.go) on the very first request.
+func hints(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><title>Hints</title></head><body><pre id="ch">` +
+		html.EscapeString(r.Header.Get("Sec-CH-UA")) + `</pre></body></html>`))
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", page(indexHTML))
 	mux.HandleFunc("GET /page2", page(page2HTML))
+	mux.HandleFunc("GET /hints", hints)
 	log.Fatal(http.ListenAndServe("127.0.0.1:18080", mux))
 }

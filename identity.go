@@ -34,23 +34,35 @@ import (
 // emulation used to give, and outerHeight > innerHeight as in a real window.
 const headlessWindow = "1280,887"
 
-// headlessScreen is the screen a headless session reports. Headless Chrome
-// otherwise defaults to 800x600, smaller than its own window: on Linux with
-// any build, and on macOS with current Chrome (rod's Chromium 128 on macOS
-// ignores the switch and reports the real display, which is fine too).
-const headlessScreen = "{1920x1080}"
-
-// screenFor is the --screen-info for a headless window ("W,H"): 1920x1080,
-// or the window's own size where it is larger, so the window always fits on
-// its screen.
-func screenFor(window string) string {
-	w, h, ok := strings.Cut(window, ",")
-	wi, errW := strconv.Atoi(w)
-	hi, errH := strconv.Atoi(h)
-	if !ok || errW != nil || errH != nil || (wi <= 1920 && hi <= 1080) {
-		return headlessScreen
+// screenFor is the screen a headless window ("W,H") reports: 1920x1080, or
+// the window's own size where it is larger, so the window always fits on its
+// screen. Headless Chrome otherwise reports 800x600, smaller than its window,
+// on Linux with any build and on macOS with current Chrome.
+func screenFor(window string) (w, h int) {
+	ws, hs, ok := strings.Cut(window, ",")
+	wi, errW := strconv.Atoi(ws)
+	hi, errH := strconv.Atoi(hs)
+	if !ok || errW != nil || errH != nil {
+		return 1920, 1080
 	}
-	return fmt.Sprintf("{%dx%d}", max(wi, 1920), max(hi, 1080))
+	return max(wi, 1920), max(hi, 1080)
+}
+
+// screenInfoSince is the first Chrome whose headless mode takes --screen-info.
+// Older builds (rod's Chromium 128) ignore it and size the screen on Linux from
+// --ozone-override-screen-size, which current Chrome refuses to start with
+// (154 exits at once); on macOS they report the real display either way.
+const screenInfoSince = 132
+
+// setHeadlessScreen sets the screen for a headless window, with the switch
+// the browser's version (major, 0 if unknown) understands.
+func setHeadlessScreen(l *launcher.Launcher, window string, major int) {
+	w, h := screenFor(window)
+	if major > 0 && major < screenInfoSince {
+		l.Set("ozone-override-screen-size", fmt.Sprintf("%d,%d", w, h))
+		return
+	}
+	l.Set("screen-info", fmt.Sprintf("{%dx%d}", w, h))
 }
 
 var chromeVersionRE = regexp.MustCompile(`(\d+)\.\d+\.\d+\.\d+`)
@@ -107,11 +119,11 @@ func configureIdentity(l *launcher.Launcher, opts startOpts, bin, goos string) (
 	window, _ := launchWindow(opts.window, opts.headless)
 	ua = opts.userAgent
 	launchIdentity = !opts.headless // a window shows the browser as it is
+	major := 0
 	if opts.headless {
-		if ua == "" {
-			if major := chromeMajorVersion(bin); major > 0 {
-				ua = desktopUserAgent(goos, major)
-			}
+		major = chromeMajorVersion(bin)
+		if ua == "" && major > 0 {
+			ua = desktopUserAgent(goos, major)
 		}
 		launchIdentity = ua != ""
 	}
@@ -126,7 +138,7 @@ func configureIdentity(l *launcher.Launcher, opts startOpts, bin, goos string) (
 			// Screenshots stay 1280x800 pixels on HiDPI Macs, as with the
 			// emulated device this replaces.
 			l.Set("force-device-scale-factor", "1")
-			l.Set("screen-info", screenFor(window))
+			setHeadlessScreen(l, window, major)
 		}
 	}
 	if opts.lang != "" {

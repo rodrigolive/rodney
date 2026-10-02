@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -86,11 +87,43 @@ func withholdClientHints(page *rod.Page, s *State) error {
 
 // applySiteProvisions applies what the page's current site needs for this
 // command (see withholdClientHints). Best-effort: a page that can't be asked
-// where it is gets nothing special.
+// where it is gets nothing special. Commands that navigate elsewhere apply it
+// for their destination themselves (open, newpage, back, forward); a page
+// that redirects to Reddit by itself, or a click that leads there, gets it
+// from the next command on.
 func applySiteProvisions(page *rod.Page, s *State) {
+	if len(noClientHintsHosts()) == 0 {
+		return
+	}
 	info, err := page.Info()
 	if err != nil || !withholdsClientHints(info.URL) {
 		return
 	}
-	_ = withholdClientHints(page, s)
+	warnWithhold(withholdClientHints(page, s))
+}
+
+// applyHistoryProvisions applies the provision for the history entry that
+// back (step -1) or forward (+1) is about to load, which is fetched again:
+// rodney sessions run with the cache disabled.
+func applyHistoryProvisions(page *rod.Page, s *State, step int) {
+	if len(noClientHintsHosts()) == 0 {
+		return
+	}
+	h, err := proto.PageGetNavigationHistory{}.Call(page)
+	if err != nil {
+		return
+	}
+	i := h.CurrentIndex + step
+	if i < 0 || i >= len(h.Entries) || !withholdsClientHints(h.Entries[i].URL) {
+		return
+	}
+	warnWithhold(withholdClientHints(page, s))
+}
+
+// warnWithhold reports a failed provision without failing the command: the
+// page still loads, it may just be challenged.
+func warnWithhold(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not withhold client hints: %v\n", err)
+	}
 }

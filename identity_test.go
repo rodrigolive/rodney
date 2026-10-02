@@ -76,9 +76,12 @@ func TestConfigureIdentity_HeadlessScreen(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("needs a shell script stand-in for the browser")
 	}
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho 'Google Chrome 154.0.8037.97'\n"), 0o755); err != nil {
-		t.Fatal(err)
+	version := func(v string) {
+		if err := os.WriteFile(fake, []byte("#!/bin/sh\necho '"+v+"'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
+	version("Google Chrome 154.0.8037.97")
 	for _, goos := range []string{"linux", "darwin"} {
 		l := launcher.New()
 		if _, li := configureIdentity(l, startOpts{headless: true}, fake, goos); !li {
@@ -86,9 +89,16 @@ func TestConfigureIdentity_HeadlessScreen(t *testing.T) {
 		}
 		// Current headless Chrome reports 800x600 on macOS too, under a
 		// 1280x887 window.
-		if got := l.Get("screen-info"); got != screenFor(headlessWindow) {
-			t.Errorf("%s: screen-info = %q, want %q", goos, got, screenFor(headlessWindow))
+		if got := l.Get("screen-info"); got != "{1920x1080}" || l.Has("ozone-override-screen-size") {
+			t.Errorf("%s: screen-info = %q; Chrome 154 takes --screen-info and exits on the ozone switch", goos, got)
 		}
+	}
+	// rod's Chromium 128 ignores --screen-info; on Linux the ozone switch works.
+	version("Chromium 128.0.6568.0")
+	l := launcher.New()
+	configureIdentity(l, startOpts{headless: true}, fake, "linux")
+	if got := l.Get("ozone-override-screen-size"); got != "1920,1080" || l.Has("screen-info") {
+		t.Errorf("Chromium 128: ozone-override-screen-size = %q", got)
 	}
 }
 
@@ -358,7 +368,13 @@ func TestLaunchIdentity_WhatPagesSee(t *testing.T) {
 		t.Errorf("window %dx%d must enclose the page area", got.Get("ow").Int(), got.Get("oh").Int())
 	}
 	if got.Get("sw").Int() < got.Get("ow").Int() || got.Get("sh").Int() < got.Get("oh").Int() {
-		t.Errorf("screen %dx%d must enclose the window", got.Get("sw").Int(), got.Get("sh").Int())
+		// Chrome before screenInfoSince on macOS reports the real display
+		// whatever it is told (CI's runner has a 1024x768 one).
+		if runtime.GOOS == "darwin" && chromeMajorVersion(bin) < screenInfoSince {
+			t.Logf("screen %dx%d is the real display (old Chrome on macOS)", got.Get("sw").Int(), got.Get("sh").Int())
+		} else {
+			t.Errorf("screen %dx%d must enclose the window", got.Get("sw").Int(), got.Get("sh").Int())
+		}
 	}
 	if got.Get("ice").Int() != 0 {
 		t.Errorf("behind a proxy WebRTC must not gather non-proxied candidates, got %d", got.Get("ice").Int())
@@ -377,7 +393,8 @@ func TestLaunchIdentity_WhatPagesSee(t *testing.T) {
 	if withheld.SecChUa != "" || page.MustEval(`() => (navigator.userAgentData?.brands || []).length`).Int() != 0 {
 		t.Errorf("client hints should be withheld, server saw Sec-CH-UA %q", withheld.SecChUa)
 	}
-	if withheld.UA != ua || withheld.Lang != seen.Lang {
+	// Both runs' first language: Chrome may send only that one (above).
+	if withheld.UA != ua || withheld.Lang == "" || !strings.HasPrefix(withheld.Lang, "es-ES") {
 		t.Errorf("withholding changed the UA (%q) or languages (%q, was %q)", withheld.UA, withheld.Lang, seen.Lang)
 	}
 }
@@ -392,15 +409,15 @@ func TestProxiedViaArgs(t *testing.T) {
 }
 
 func TestScreenFor(t *testing.T) {
-	for window, want := range map[string]string{
-		"1280,887":  "{1920x1080}",
-		"1920,1080": "{1920x1080}",
-		"2560,1440": "{2560x1440}",
-		"1920,1200": "{1920x1200}",
-		"bad":       "{1920x1080}",
+	for window, want := range map[string][2]int{
+		"1280,887":  {1920, 1080},
+		"1920,1080": {1920, 1080},
+		"2560,1440": {2560, 1440},
+		"1920,1200": {1920, 1200},
+		"bad":       {1920, 1080},
 	} {
-		if got := screenFor(window); got != want {
-			t.Errorf("screenFor(%q) = %q, want %q (the window must fit its screen)", window, got, want)
+		if w, h := screenFor(window); w != want[0] || h != want[1] {
+			t.Errorf("screenFor(%q) = %dx%d, want %dx%d (the window must fit its screen)", window, w, h, want[0], want[1])
 		}
 	}
 }

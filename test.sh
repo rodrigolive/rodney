@@ -198,6 +198,31 @@ assert_eq "$OUT" "Test Page" "switched back to first tab"
 OUT=$($CLI closepage "$NEW_ID" 2>&1)
 assert_contains "$OUT" "Closed" "closepage closes tab by target id"
 
+# --- Site provisions ---
+echo "[Site provisions]"
+
+# The fixture server stands in for Reddit: the hints must be gone from the
+# first request of open, newpage and back, the ones the site decides on.
+OUT=$($CLI open http://127.0.0.1:18080/hints >/dev/null 2>&1; $CLI text "#ch" 2>&1)
+assert_contains "$OUT" "Chrom" "without the provision the request carries Sec-CH-UA"
+
+export RODNEY_NO_CLIENT_HINTS=127.0.0.1
+OUT=$($CLI open http://127.0.0.1:18080/hints >/dev/null 2>&1; $CLI text "#ch" 2>&1)
+assert_eq "$OUT" "" "open withholds client hints on a provisioned host"
+
+OUT=$($CLI js 'navigator.userAgentData ? navigator.userAgentData.brands.length : 0' 2>&1)
+assert_eq "$OUT" "0" "later commands keep navigator.userAgentData blank there"
+
+HINTS_ID=$($CLI newpage http://127.0.0.1:18080/hints 2>&1 | sed -n 's/^target: //p')
+OUT=$($CLI --target "$HINTS_ID" text "#ch" 2>&1)
+assert_eq "$OUT" "" "newpage withholds client hints on its first request"
+$CLI closepage "$HINTS_ID" >/dev/null 2>&1
+
+$CLI open http://localhost:18080/ >/dev/null 2>&1
+OUT=$($CLI back 2>&1 >/dev/null; $CLI text "#ch" 2>&1)
+assert_eq "$OUT" "" "back into a provisioned host withholds them too"
+unset RODNEY_NO_CLIENT_HINTS
+
 # --- Cleanup ---
 echo "[Cleanup]"
 

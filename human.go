@@ -395,11 +395,16 @@ func humanPointAt(page *rod.Page, el *rod.Element) (point, error) {
 		// Clipped by a scroll container of its own (a carousel, a list, a
 		// dialog's scrolling body): the page is where it should be, the
 		// container isn't. Let the browser scroll the containers, then aim.
+		// Chrome hit-tests a just-scrolled container at its old offset until
+		// a frame has been painted, so wait for one (or two) between tries.
 		if err := el.ScrollIntoView(); err == nil {
-			if box, err = elementBox(el); err != nil {
-				return point{}, err
+			for try := 0; try < 3 && !ok; try++ {
+				waitFrame(page)
+				if box, err = elementBox(el); err != nil {
+					return point{}, err
+				}
+				at, ok = visiblePointIn(el, box)
 			}
-			at, ok = visiblePointIn(el, box)
 		}
 	}
 	if !ok {
@@ -412,6 +417,15 @@ func humanPointAt(page *rod.Page, el *rod.Element) (point, error) {
 		return point{}, err
 	}
 	return at, nil
+}
+
+// waitFrame waits until the page has painted two frames, or 150ms where it
+// paints none (a hidden tab).
+func waitFrame(page *rod.Page) {
+	_, _ = page.Eval(`() => new Promise(r => {
+		setTimeout(r, 150)
+		requestAnimationFrame(() => requestAnimationFrame(r))
+	})`)
 }
 
 // visiblePointIn samples points in box until one hits el (or a descendant),
