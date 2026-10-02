@@ -1113,7 +1113,7 @@ func cmdStart(args []string) {
 		l.Set("ignore-certificate-errors")
 	}
 
-	proxied := proxyPort > 0 || proxiedViaEnv(runtime.GOOS)
+	proxied := proxyPort > 0 || proxiedViaEnv(runtime.GOOS) || proxiedViaArgs(opts.chromeArgs)
 	if err := writeProfilePrefs(dataDir, identityPrefs(proxied, opts.lang)); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not set profile preferences (WebRTC policy, languages): %v\n", err)
 	}
@@ -1277,6 +1277,8 @@ func cmdStop(args []string) {
 	// Chrome writes its Preferences on the way out, and a 'start' right after
 	// edits them; the PID to wait on goes with the state, so wait here.
 	waitChromeExit(s)
+	// The pointer positions belong to this browser's tabs.
+	_ = os.RemoveAll(filepath.Join(stateDir(), "pointer"))
 	removeState()
 	fmt.Println("Chrome stopped")
 }

@@ -179,6 +179,17 @@ func proxiedViaEnv(goos string) bool {
 	return false
 }
 
+// proxiedViaArgs reports whether a --chrome-arg names a proxy server.
+func proxiedViaArgs(chromeArgs []string) bool {
+	for _, a := range chromeArgs {
+		name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if name == "proxy-server" || name == "proxy-pac-url" {
+			return true
+		}
+	}
+	return false
+}
+
 // profilePrefs are the Preferences entries 'start' manages, by dotted path. A
 // nil value removes the entry.
 type profilePrefs map[string]any

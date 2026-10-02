@@ -356,3 +356,12 @@ func TestLaunchIdentity_WhatPagesSee(t *testing.T) {
 		t.Errorf("behind a proxy WebRTC must not gather non-proxied candidates, got %d", got.Get("ice").Int())
 	}
 }
+
+func TestProxiedViaArgs(t *testing.T) {
+	if !proxiedViaArgs([]string{"--use-angle=gl", "--proxy-server=http://127.0.0.1:3128"}) {
+		t.Error("a --proxy-server chrome-arg means the launch is proxied (WebRTC policy needed)")
+	}
+	if proxiedViaArgs([]string{"--use-angle=gl"}) {
+		t.Error("no proxy switch: not proxied")
+	}
+}
